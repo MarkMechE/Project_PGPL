@@ -1,6 +1,11 @@
 import osmnx as ox
 import geopandas as gpd
 import os
+import city2graph as c2g
+
+# This converts your Incheon GPKG into a "Pipe Graph"
+pipe_graph = c2g.Graph.from_file("data/incheon_graph.gpkg")
+print(f"Graph converted: {len(pipe_graph.nodes)} pipe junctions found.")
 
 # Create data directory if it doesn't exist
 os.makedirs('data', exist_ok=True)
