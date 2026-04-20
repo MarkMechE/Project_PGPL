@@ -1,11 +1,12 @@
 import os
+import json
 import time
 import numpy as np
 import pandas as pd
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
-from pgpl_brain import PULSE_AT_Brain
+from pgpl_brain import PULSE_AT_Brain, calculate_sensor_deployment
 from pulse_at_bridge import (
     load_or_generate_pulse_at_data,
     map_columns,
@@ -29,6 +30,13 @@ PRIORITY_COLOR = {
     "P4-LOW":      "#378ADD",
 }
 
+PRIORITY_ORDER = {
+    "P1-CRITICAL": 0,
+    "P2-HIGH":     1,
+    "P3-MODERATE": 2,
+    "P4-LOW":      3,
+}
+
 
 @st.cache_resource
 def load_brain():
@@ -40,11 +48,23 @@ def load_pulse_at_rows():
     return map_columns(load_or_generate_pulse_at_data())
 
 
+@st.cache_data
+def load_geojson_safe(path):
+    """Load GeoJSON with explicit UTF-8 — fixes Windows CP1252 error."""
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return json.load(f)
+
+
 brain        = load_brain()
 df_pulse_at  = load_pulse_at_rows()
 max_node     = max(1, len(brain.node_list))
 sensor_nodes = [int(i * max_node / N_SENSORS) for i in range(N_SENSORS)]
 total_rows   = len(df_pulse_at)
+
+# Sensor deployment plan for Eco-Delta
+DEPLOY = calculate_sensor_deployment(pipe_length_km=40, spacing_m=200)
 
 
 def _init_state():
@@ -65,14 +85,21 @@ def _init_state():
 
 _init_state()
 
+# ------------------------------------------------------------------ #
+#  Header                                                              #
+# ------------------------------------------------------------------ #
 st.title("PGPL - Eco-Delta City Leak Monitor")
 st.caption(
     f"Persistence-Gated Piezo Leak Localizer  |  "
     f"Myeongji-dong, Gangseo-gu, Busan  |  "
-    f"{N_SENSORS} sensor nodes  |  "
-    f"{N_SENSORS * 2} piezo mics"
+    f"Demo: {N_SENSORS} nodes  |  "
+    f"Full deployment: {DEPLOY['recommended_nodes']} nodes / "
+    f"{DEPLOY['total_mics']} mics"
 )
 
+# ------------------------------------------------------------------ #
+#  Transport controls                                                  #
+# ------------------------------------------------------------------ #
 c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 2, 3])
 
 with c1:
@@ -110,26 +137,29 @@ with c5:
         reg   = df_pulse_at.iloc[st.session_state.row_idx].get("regime", "-")
         label = "LEAK" if reg == "stress" else "NORMAL"
         st.markdown(
-            f"**Regime:** {label} | "
-            f"**Sensors:** {N_SENSORS} | "
-            f"**Min persist:** {brain.min_persist}"
+            f"**Regime:** {label}  |  "
+            f"**Min persist:** {brain.min_persist}  |  "
+            f"**Dispatches:** {len(st.session_state.dispatch_events)}"
         )
 
 st.divider()
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+# ------------------------------------------------------------------ #
+#  Tabs                                                                #
+# ------------------------------------------------------------------ #
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Live Map",
     "Signal and Gate",
     "Metrics",
     "Event Log",
+    "Sensor Plan",
     "About",
 ])
 
 
-def priority_color(priority):
-    return PRIORITY_COLOR.get(priority, "#888780")
-
-
+# ------------------------------------------------------------------ #
+#  Helpers                                                             #
+# ------------------------------------------------------------------ #
 def build_map(dispatch_events, last_gps=None):
     m = folium.Map(
         location=ECO_DELTA_CENTER,
@@ -137,9 +167,10 @@ def build_map(dispatch_events, last_gps=None):
         tiles="OpenStreetMap",
     )
 
-    if os.path.exists(EDGES_PATH):
+    edges_data = load_geojson_safe(EDGES_PATH)
+    if edges_data:
         folium.GeoJson(
-            EDGES_PATH,
+            edges_data,
             name="Pipe network",
             style_function=lambda _: {
                 "color": "#3B82F6", "weight": 1.5, "opacity": 0.6
@@ -160,7 +191,7 @@ def build_map(dispatch_events, last_gps=None):
 
     for ev in dispatch_events[:-1]:
         if ev.get("gps"):
-            color = priority_color(ev.get("priority", ""))
+            color = PRIORITY_COLOR.get(ev.get("priority", ""), "#888780")
             folium.CircleMarker(
                 location=list(ev["gps"]),
                 radius=6,
@@ -176,14 +207,15 @@ def build_map(dispatch_events, last_gps=None):
             ).add_to(m)
 
     if last_gps and dispatch_events:
-        last = dispatch_events[-1]
-        color = priority_color(last.get("priority", ""))
+        last  = dispatch_events[-1]
+        color = PRIORITY_COLOR.get(last.get("priority", ""), "#E24B4A")
         folium.Marker(
             location=list(last_gps),
             icon=folium.Icon(color="red", icon="info-sign"),
             popup=(
                 f"LATEST — {last.get('priority','—')}<br>"
                 f"Type: {last.get('anomaly','—')}<br>"
+                f"Severity: {last.get('severity','—')}<br>"
                 f"Distance: {last.get('loc_m')} m"
             ),
         ).add_to(m)
@@ -219,7 +251,7 @@ def advance_one_row():
         "regime": sensors.get("regime", "-"),
     })
 
-    log_row = {
+    st.session_state.cycle_log.append({
         "row":       idx,
         "timestamp": sensors.get("timestamp", ""),
         "regime":    sensors.get("regime", "-"),
@@ -235,8 +267,7 @@ def advance_one_row():
         "severity":  result.get("severity", "-"),
         "loc_m":     result.get("loc_m", "-"),
         "error_m":   result.get("error_m", "-"),
-    }
-    st.session_state.cycle_log.append(log_row)
+    })
 
     if result["flag"] == "DISPATCH":
         ev = {
@@ -249,15 +280,22 @@ def advance_one_row():
             "severity": result.get("severity", 0),
         }
         st.session_state.dispatch_events.append(ev)
-
         pq = st.session_state.priority_queue
         pq.append(ev)
-        pq.sort(key=lambda x: x.get("severity", 0), reverse=True)
+        pq.sort(
+            key=lambda x: (
+                PRIORITY_ORDER.get(x.get("priority", "P4-LOW"), 3),
+                -(x.get("severity") or 0),
+            )
+        )
         st.session_state.priority_queue = pq
 
     st.session_state.row_idx += 1
 
 
+# ------------------------------------------------------------------ #
+#  Auto-advance                                                        #
+# ------------------------------------------------------------------ #
 if st.session_state.playing:
     advance_one_row()
     time.sleep(0.05)
@@ -271,34 +309,29 @@ if not st.session_state.playing:
         advance_one_row()
         st.rerun()
 
-
+# ------------------------------------------------------------------ #
+#  Tab 1 — Live Map                                                    #
+# ------------------------------------------------------------------ #
 with tab1:
     r = st.session_state.last_result
 
     if r is None:
         st.info("Press Play to start processing PULSE-AT data.")
     elif r["flag"] == "DISPATCH":
-        pri = r.get("priority", "")
+        pri = r.get("priority", "P4-LOW")
+        msg = (
+            f"{pri}  —  {r.get('anomaly','—')} detected  |  "
+            f"Distance: {r.get('loc_m')} m  |  "
+            f"Severity: {r.get('severity')}  |  "
+            f"GPS: {r.get('gps')}  |  "
+            f"Score: {r['score']}"
+        )
         if "P1" in pri:
-            st.error(
-                f"{pri} — {r.get('anomaly')} at {r.get('loc_m')} m  |  "
-                f"Severity: {r.get('severity')}  |  "
-                f"GPS: {r.get('gps')}  |  "
-                f"Score: {r['score']}"
-            )
+            st.error(msg)
         elif "P2" in pri:
-            st.warning(
-                f"{pri} — {r.get('anomaly')} at {r.get('loc_m')} m  |  "
-                f"Severity: {r.get('severity')}  |  "
-                f"GPS: {r.get('gps')}  |  "
-                f"Score: {r['score']}"
-            )
+            st.warning(msg)
         else:
-            st.info(
-                f"{pri} — {r.get('anomaly')} at {r.get('loc_m')} m  |  "
-                f"Severity: {r.get('severity')}  |  "
-                f"Score: {r['score']}"
-            )
+            st.info(msg)
     else:
         st.success(
             f"MONITOR  |  Score: {r['score']}  |  "
@@ -328,13 +361,15 @@ with tab1:
         k6.metric("Priority",   r.get("priority", "-"))
 
     if st.session_state.priority_queue:
-        st.markdown("**Active priority queue — ranked by severity**")
-        pq_df = pd.DataFrame(st.session_state.priority_queue)[
-            ["row", "priority", "anomaly", "severity", "loc_m", "error"]
-        ]
+        st.markdown("---")
+        st.markdown("**Active priority queue — P1 first**")
+        pq_df = pd.DataFrame(st.session_state.priority_queue)
+        pq_df = pq_df[["row", "priority", "anomaly", "severity", "loc_m", "error"]]
         st.dataframe(pq_df, use_container_width=True, hide_index=True)
 
-
+# ------------------------------------------------------------------ #
+#  Tab 2 — Signal and Gate                                             #
+# ------------------------------------------------------------------ #
 with tab2:
     st.subheader("Acoustic signals from current PULSE-AT row")
     sensors = st.session_state.last_sensors
@@ -352,26 +387,27 @@ with tab2:
                 height=220,
             )
             st.caption(
-                "Delay between curves encodes acoustic time-of-flight to distance"
+                "Delay between curves = acoustic time-of-flight = distance to leak"
             )
 
         with col_b:
             st.markdown("**Gate state this row**")
             r2 = st.session_state.last_result
             if r2:
+                gate_data = [
+                    {"metric": "Score",        "value": r2["score"]},
+                    {"metric": "PSI",          "value": r2["psi"]},
+                    {"metric": "Persist",      "value": r2["persist"]},
+                    {"metric": "p-value",      "value": r2.get("pvalue", "-")},
+                    {"metric": "Epsilon",      "value": r2["eps"]},
+                    {"metric": "Flag",         "value": r2["flag"]},
+                    {"metric": "Anomaly type", "value": r2.get("anomaly", "-")},
+                    {"metric": "Anom prob",    "value": r2.get("anom_prob", "-")},
+                    {"metric": "Severity",     "value": r2.get("severity", "-")},
+                    {"metric": "Priority",     "value": r2.get("priority", "-")},
+                ]
                 st.dataframe(
-                    pd.DataFrame([
-                        {"metric": "Score",        "value": r2["score"]},
-                        {"metric": "PSI",          "value": r2["psi"]},
-                        {"metric": "Persist",      "value": r2["persist"]},
-                        {"metric": "p-value",      "value": r2.get("pvalue", "-")},
-                        {"metric": "Epsilon",      "value": r2["eps"]},
-                        {"metric": "Flag",         "value": r2["flag"]},
-                        {"metric": "Anomaly type", "value": r2.get("anomaly", "-")},
-                        {"metric": "Anom prob",    "value": r2.get("anom_prob", "-")},
-                        {"metric": "Priority",     "value": r2.get("priority", "-")},
-                        {"metric": "Severity",     "value": r2.get("severity", "-")},
-                    ]),
+                    pd.DataFrame(gate_data),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -386,7 +422,9 @@ with tab2:
     else:
         st.info("Press Play to start.")
 
-
+# ------------------------------------------------------------------ #
+#  Tab 3 — Metrics                                                     #
+# ------------------------------------------------------------------ #
 with tab3:
     st.subheader("Live accuracy metrics")
     log = st.session_state.cycle_log
@@ -425,19 +463,23 @@ with tab3:
             height=180,
         )
 
-        if "priority" in df_log.columns:
-            st.markdown("**Dispatch breakdown by priority**")
+        if len(dispatch) > 0 and "priority" in dispatch.columns:
+            st.markdown("**Dispatch count by priority level**")
             pri_counts = (
                 dispatch["priority"]
                 .value_counts()
                 .reindex(["P1-CRITICAL", "P2-HIGH", "P3-MODERATE", "P4-LOW"])
                 .fillna(0)
+                .astype(int)
             )
             st.bar_chart(pri_counts, height=140)
 
-        if "anomaly" in df_log.columns:
-            st.markdown("**Dispatch breakdown by anomaly type**")
-            st.bar_chart(dispatch["anomaly"].value_counts(), height=140)
+        if len(dispatch) > 0 and "anomaly" in dispatch.columns:
+            st.markdown("**Dispatch count by anomaly type**")
+            st.bar_chart(
+                dispatch["anomaly"].value_counts(),
+                height=140,
+            )
 
     else:
         st.info("No data yet — press Play.")
@@ -461,7 +503,9 @@ with tab3:
         b2.metric("F1",         f"{f1_s:.3f}")
         b3.metric("Mean error", f"{err_s:.2f} m")
 
-
+# ------------------------------------------------------------------ #
+#  Tab 4 — Event Log                                                   #
+# ------------------------------------------------------------------ #
 with tab4:
     st.subheader("Row-by-row event log")
     if st.session_state.cycle_log:
@@ -480,14 +524,90 @@ with tab4:
     else:
         st.info("No events yet.")
 
-
+# ------------------------------------------------------------------ #
+#  Tab 5 — Sensor Plan                                                 #
+# ------------------------------------------------------------------ #
 with tab5:
+    st.subheader("Sensor deployment plan — Eco-Delta City")
+
+    st.markdown(
+        "Minimum sensor count is calculated from pipe network length "
+        "divided by the acoustic detection range per node (spacing). "
+        "A 20% redundancy buffer is added for Eco-Delta saline and tidal conditions."
+    )
+
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        pipe_km  = st.number_input(
+            "Total pipe length (km)", min_value=1, max_value=500,
+            value=40, step=5
+        )
+        spacing  = st.selectbox(
+            "Node spacing (m) — detection range per node",
+            options=[100, 150, 200, 250, 300],
+            index=2,
+        )
+
+    deploy = calculate_sensor_deployment(
+        pipe_length_km=pipe_km,
+        spacing_m=spacing,
+    )
+
+    with col_s2:
+        st.metric("Base nodes required",    deploy["base_nodes"])
+        st.metric("Redundancy nodes (+20%)", deploy["redundancy_nodes"])
+        st.metric("Total recommended nodes", deploy["recommended_nodes"])
+        st.metric("Total piezo mics",        deploy["total_mics"])
+
+    st.markdown("---")
+    st.markdown("**Breakdown table**")
+    st.dataframe(
+        pd.DataFrame([{
+            "Pipe length (km)":         deploy["pipe_length_km"],
+            "Node spacing (m)":         deploy["spacing_m"],
+            "Base nodes":               deploy["base_nodes"],
+            "Redundancy nodes":         deploy["redundancy_nodes"],
+            "Recommended nodes":        deploy["recommended_nodes"],
+            "Piezo mics (x2)":          deploy["total_mics"],
+            "Coverage per node (m)":    deploy["coverage_m"],
+        }]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("**Reference: Eco-Delta City estimates**")
+    reference = []
+    for km, label in [
+        (8,  "Myeongji-dong core zone"),
+        (20, "Phase 1 distribution mains"),
+        (40, "Full Eco-Delta network"),
+        (80, "Gangseo-gu district wide"),
+    ]:
+        d = calculate_sensor_deployment(km, spacing_m=200)
+        reference.append({
+            "Zone":             label,
+            "Pipe length (km)": km,
+            "Nodes":            d["recommended_nodes"],
+            "Mics":             d["total_mics"],
+        })
+    st.dataframe(
+        pd.DataFrame(reference),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ------------------------------------------------------------------ #
+#  Tab 6 — About                                                       #
+# ------------------------------------------------------------------ #
+with tab6:
     st.markdown(f"""
 ## PGPL - Persistence-Gated Piezo Leak Localizer
 
 **Location**: Eco-Delta City, Myeongji-dong, Gangseo-gu, Busan, South Korea
 
-**Sensor deployment**: {N_SENSORS} nodes x 2 piezo mics = {N_SENSORS * 2} mics total, spaced 50 m apart
+**Demo deployment**: {N_SENSORS} nodes / {N_SENSORS * 2} mics
+
+**Full deployment (40 km network)**: {DEPLOY['recommended_nodes']} nodes / {DEPLOY['total_mics']} mics at 200 m spacing
 
 | Layer | File | Role |
 |---|---|---|
@@ -503,15 +623,16 @@ with tab5:
 
 **Priority levels**
 
-| Level | Trigger | Action |
+| Level | Condition | Action |
 |---|---|---|
 | P1-CRITICAL | Burst, severity >= 0.80 | Immediate dispatch + zone shutoff |
 | P2-HIGH | Leak, severity 0.50-0.80 | Repair within 4 hours |
-| P3-MODERATE | Pressure drop, severity 0.20-0.50 | Log and monitor |
-| P4-LOW | Slug or noise, severity < 0.20 | Record only |
+| P3-MODERATE | Pressure drop 0.20-0.50 | Log and monitor |
+| P4-LOW | Slug or noise < 0.20 | Record only |
 
-**Patent claim core**: Multi-variable z-score persistence gating (>= {brain.min_persist}
-consecutive windows, PSI >= 0.20) as precondition for acoustic cross-correlation
-triangulation, projecting distance onto a geospatial pipe graph to produce a
-GPS coordinate, with severity-ranked dispatch output.
+**Patent claim core**: Multi-variable z-score persistence gating
+(>= {brain.min_persist} consecutive windows, PSI >= 0.20) as precondition
+for acoustic cross-correlation triangulation, projecting distance onto a
+geospatial pipe graph to produce a GPS coordinate with severity-ranked
+dispatch output.
 """)
