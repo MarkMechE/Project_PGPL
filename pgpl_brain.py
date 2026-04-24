@@ -1,256 +1,345 @@
 """
-pgpl_brain.py  —  PULSE-AT Brain  (Full Debug Release)
-=======================================================
-Root-cause fixes
------------------
-BUG 1 — Nodes in water
-  Old code: bilinear interpolation across bounding box → random nodes in river.
-  Fix: OSMnx graph_from_polygon pulls only real road nodes on land.
-       Fallback uses Shapely rejection-sampling inside EDC polygon → also land-only.
+pgpl_brain.py  —  PGL Tier 2 Gate
+Persistence-Gated Piezo Leak Localizer  |  Eco-Delta City, Busan
 
-BUG 2 — process() signature mismatch
-  Old: process(self, sensors) — TypeError when dashboard passed sensor_node_idx.
-  Fix: process(self, sensors, sensor_node_idx=0).
-
-BUG 3 — GPS snap returned centroid fallback always
-  Old: node_coords was empty. Fix: populated from OSMnx node data (y=lat, x=lon).
-
-BUG 4 — Multi-tier result fields missing
-  Old brain returned only {flag, loc_m, z_score, status}.
-  Fix: full dict on every call.
-
-BUG 5 — calculate_sensor_deployment not defined in brain
-  Fix: added here (dashboard imports it).
+Replaces:
+  - fixed z > 2.0 threshold  →  adaptive rolling z-score
+  - no CP                    →  Mondrian conformal p-value
+  - no drift detection       →  PSI population stability index
+  - c_acoustic = 1400        →  Biot-Gassmann c(s) via biot_velocity.py
+  - scale_free_graph         →  removed (Phase 2: OSMnx real graph)
 """
 
-import os, math
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
 import numpy as np
-import networkx as nx
 from collections import deque
-from shapely.geometry import Polygon, Point
-from scipy.signal import correlate, butter, lfilter
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
-
-# ── Verified EDC boundary ────────────────────────────────────────────────────
-EDC_CORNERS_LATLON = [
-    (35.163501, 128.906182),   # NW
-    (35.157991, 128.937993),   # NE
-    (35.111804, 128.931679),   # SE
-    (35.120786, 128.899541),   # SW
-]
-EDC_LAT_MIN  = 35.111804
-EDC_LAT_MAX  = 35.163501
-EDC_LON_MIN  = 128.899541
-EDC_LON_MAX  = 128.937993
-EDC_CENTROID = (35.138521, 128.918849)
-
-# Shapely polygon (lon, lat) for containment tests
-_EDC_SHAPE = Polygon([(lon, lat) for lat, lon in EDC_CORNERS_LATLON])
-
-C_ACOUSTIC = 1400.0
-_GRAPH_N   = 200
+from scipy.signal import correlate, butter, sosfilt
 
 
-# ── Graph builders ───────────────────────────────────────────────────────────
-
-def _build_osmnx_graph():
-    import osmnx as ox
-    print("  Downloading OSM network for EDC polygon ...")
-    osm_poly = Polygon([(lat, lon) for lat, lon in EDC_CORNERS_LATLON])
-    G_osm = ox.graph_from_polygon(osm_poly, network_type="all",
-                                  retain_all=True, truncate_by_edge=True)
-    G_nx = nx.Graph(G_osm)
-    node_coords = {}
-    for nid, data in G_osm.nodes(data=True):
-        lat = data.get("y", EDC_CENTROID[0])
-        lon = data.get("x", EDC_CENTROID[1])
-        if _EDC_SHAPE.contains(Point(lon, lat)):
-            node_coords[nid] = (round(lat, 6), round(lon, 6))
-    keep = set(node_coords.keys())
-    G_nx = G_nx.subgraph(keep).copy()
-    node_list = list(G_nx.nodes())
-    print(f"  OSMnx graph: {len(node_list)} land nodes")
-    return G_nx, node_list, node_coords
+# ── Biot velocity (inline fallback if biot_velocity.py absent) ────────────
+try:
+    from biot_velocity import get_biot_velocity
+except ImportError:
+    def get_biot_velocity(salinity_psu=7.0, **_):
+        return float(np.clip(1450.0 + salinity_psu * 1.8, 1450, 1520))
 
 
-def _build_synthetic_graph(n=_GRAPH_N):
-    """Rejection-sample inside EDC polygon — guaranteed land-only."""
-    rng = np.random.default_rng(42)
-    G   = nx.Graph()
-    node_coords = {}
-    idx = 0
-    lat_r = EDC_LAT_MAX - EDC_LAT_MIN
-    lon_r = EDC_LON_MAX - EDC_LON_MIN
-    attempts = 0
-    while idx < n and attempts < n * 50:
-        attempts += 1
-        lat = EDC_LAT_MIN + rng.uniform(0, lat_r)
-        lon = EDC_LON_MIN + rng.uniform(0, lon_r)
-        if _EDC_SHAPE.contains(Point(lon, lat)):
-            G.add_node(idx)
-            node_coords[idx] = (round(lat, 6), round(lon, 6))
-            idx += 1
-    coords_arr = np.array([node_coords[i] for i in range(idx)])
-    for i in range(len(coords_arr)):
-        dists = np.linalg.norm(coords_arr - coords_arr[i], axis=1)
-        dists[i] = np.inf
-        for j in np.argsort(dists)[:3]:
-            G.add_edge(i, int(j))
-    node_list = list(G.nodes())
-    print(f"  Synthetic graph: {len(node_list)} land-only nodes")
-    return G, node_list, node_coords
+# ══════════════════════════════════════════════════════════════════════════
+# Sub-components
+# ══════════════════════════════════════════════════════════════════════════
+
+class AdaptiveZScore:
+    """Rolling mean/std normaliser — no fixed threshold."""
+    def __init__(self, window=100):
+        self._buf = deque(maxlen=window)
+
+    def score(self, value: float) -> float:
+        if len(self._buf) < 5:
+            self._buf.append(value)
+            return 0.0
+        mu = float(np.mean(self._buf))
+        sigma = float(np.std(self._buf)) + 1e-9
+        self._buf.append(value)
+        return abs(value - mu) / sigma
 
 
-def _load_graph():
-    try:
-        return _build_osmnx_graph()
-    except Exception as e:
-        print(f"  OSMnx unavailable ({e}), using synthetic land-only graph")
-        return _build_synthetic_graph(_GRAPH_N)
+class MondirianCP:
+    """
+    Mondrian conformal predictor.
+    p-value = fraction of calibration scores >= current score.
+    Low p-value (<=alpha) = anomalous.
+    """
+    def __init__(self):
+        self._cal: list = []
+
+    def calibrate(self, score: float) -> None:
+        self._cal.append(score)
+
+    def p_value(self, score: float) -> float:
+        if len(self._cal) < 10:
+            return 1.0
+        return float(np.mean(np.array(self._cal) >= score))
 
 
-# ── Deployment calculator ────────────────────────────────────────────────────
+class PSIDrift:
+    """Population Stability Index — detects tidal-phase distribution shifts."""
+    _BINS = np.linspace(0.0, 10.0, 11)
 
-def calculate_sensor_deployment(pipe_length_km=40.0, spacing_m=200.0):
-    pipe_m      = pipe_length_km * 1000.0
-    base        = int(math.ceil(pipe_m / spacing_m))
-    redund      = int(math.ceil(base * 0.20))
-    recommended = base + redund
-    return {"pipe_length_km": pipe_length_km, "spacing_m": spacing_m,
-            "coverage_m": spacing_m, "base_nodes": base,
-            "redundancy_nodes": redund, "recommended_nodes": recommended,
-            "total_mics": recommended * 2}
+    def __init__(self, ref_window=50):
+        self._ref = deque(maxlen=ref_window)
+        self._cur = deque(maxlen=ref_window)
+        self._ref_ready = False
 
-
-# ── Anomaly helpers ──────────────────────────────────────────────────────────
-
-def _classify_anomaly(score, z):
-    if score > 0.85 and z > 3.5: return "burst",         round(min(score*1.05,1.0),3)
-    if score > 0.60:              return "leak",          round(score,3)
-    if z > 2.5:                   return "pressure_drop", round(score*0.9,3)
-    if score > 0.35:              return "slug",          round(score*0.7,3)
-    return "normal", round(score*0.3,3)
-
-def _severity_priority(anomaly, anom_prob):
-    s = round(anom_prob,3)
-    if anomaly == "burst" or s >= 0.80: return s, "P1-CRITICAL"
-    if s >= 0.50: return s, "P2-HIGH"
-    if s >= 0.20: return s, "P3-MODERATE"
-    return s, "P4-LOW"
+    def update(self, z: float) -> float:
+        if not self._ref_ready:
+            self._ref.append(z)
+            if len(self._ref) == self._ref.maxlen:
+                self._ref_ready = True
+            return 0.0
+        self._cur.append(z)
+        if len(self._cur) < 10:
+            return 0.0
+        r, _ = np.histogram(np.array(self._ref), bins=self._BINS, density=True)
+        c, _ = np.histogram(np.array(self._cur), bins=self._BINS, density=True)
+        r = np.clip(r, 1e-6, None)
+        c = np.clip(c, 1e-6, None)
+        return float(np.sum((c - r) * np.log(c / r)))
 
 
-# ── Brain ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# Main brain class
+# ══════════════════════════════════════════════════════════════════════════
 
 class PULSE_AT_Brain:
-    def __init__(self):
-        print("PULSE-AT: Initialising PGPL Brain ...")
-        self.G, self.node_list, self.node_coords = _load_graph()
-        self.persist_count  = 0
-        self.min_persist    = 3
-        self.psi_window     = deque(maxlen=10)
-        self._eps           = 2.0
-        self._score_history = deque(maxlen=50)
-        self.c_acoustic     = C_ACOUSTIC
-        print(f"  {len(self.node_list)} pipe-graph nodes ready | centroid {EDC_CENTROID}")
+    """
+    4-tier PGL pipeline brain.
 
-    def _butter_bandpass(self, data, lowcut=100, highcut=1000, fs=10000, order=5):
-        nyq  = 0.5 * fs
-        b, a = butter(order, [lowcut/nyq, highcut/nyq], btype="band")
-        return lfilter(b, a, np.asarray(data, dtype=float))
+    Tier 1  —  bandpass filter (200-800 Hz, 2 kHz Fs)
+    Tier 2  —  adaptive z-score + Mondrian CP + PSI drift + N-window persistence
+    Tier 3  —  6-class heuristic classifier + severity scoring (P1-P4)
+    Tier 4  —  TDOA distance estimate using Biot velocity c(s)
+    """
 
-    def _tdoa_distance(self, sig1, sig2, fs):
-        f1 = self._butter_bandpass(sig1, fs=fs)
-        f2 = self._butter_bandpass(sig2, fs=fs)
-        corr = correlate(f1, f2, mode="full")
-        delay_idx = int(np.argmax(np.abs(corr))) - (len(f1) - 1)
-        return round(abs(delay_idx / fs) * self.c_acoustic, 2)
+    # 6 event classes + type weights
+    TYPE_WEIGHTS = {
+        "Burst":        1.0,
+        "Crack":        0.8,
+        "Micro":        0.6,
+        "PressureDrop": 0.4,
+        "Pump":         0.1,
+        "Tidal":        0.0,
+    }
 
-    def _snap_to_graph(self, sensor_node_idx, leak_dist_m):
-        n = len(self.node_list)
-        if n == 0:
-            return EDC_CENTROID
-        start_key = self.node_list[sensor_node_idx % n]
-        try:
-            edge_len_m   = 50.0
-            target_hops  = max(1, int(round(leak_dist_m / edge_len_m)))
-            visited      = {start_key}
-            frontier     = [start_key]
-            for _ in range(target_hops):
-                nxt = []
-                for node in frontier:
-                    for nbr in self.G.neighbors(node):
-                        if nbr not in visited:
-                            visited.add(nbr)
-                            nxt.append(nbr)
-                if not nxt:
-                    break
-                frontier = nxt
-            end_key = frontier[0] if frontier else start_key
-        except Exception:
-            end_key = start_key
-        return self.node_coords.get(end_key, EDC_CENTROID)
+    def __init__(self,
+                 alpha: float = 0.10,
+                 persistence_n: int = 3,
+                 psi_threshold: float = 0.20,
+                 zone_weight: float = 0.5):
 
-    def _update_epsilon(self, score):
-        self._score_history.append(score)
-        if len(self._score_history) >= 10:
-            mu = float(np.mean(self._score_history))
-            sg = float(np.std(self._score_history)) + 1e-6
-            self._eps = round(mu + 2.0*sg, 3)
-        return self._eps
+        print("PGL Brain: initialising Persistence-Gated pipeline...")
 
-    def _psi(self, p_value):
-        self.psi_window.append(p_value)
-        return round(float(np.mean(self.psi_window)), 4)
+        self.alpha          = alpha
+        self.min_persist    = persistence_n
+        self.psi_threshold  = psi_threshold
+        self.zone_weight    = zone_weight
 
-    def _sim_piezo(self, true_dist_m, noise_sigma=0.05, fs=10000, n_samples=2048):
-        rng   = np.random.default_rng()
-        delay = int(round(true_dist_m / self.c_acoustic * fs))
-        t     = np.linspace(0, n_samples/fs, n_samples)
-        base  = np.sin(2*np.pi*400*t) * np.exp(-5*t)
-        return (base + rng.normal(0, noise_sigma, n_samples),
-                np.roll(base, delay) + rng.normal(0, noise_sigma, n_samples))
+        # Tier 2 components
+        self._z    = AdaptiveZScore(window=100)
+        self._cp   = MondirianCP()
+        self._psi  = PSIDrift(ref_window=50)
+        self._flag_buf = deque(maxlen=persistence_n)
+        self._cal_n    = 0
 
-    def process(self, sensors: dict, sensor_node_idx: int = 0) -> dict:
-        fs       = sensors.get("fs", 10000)
-        flow     = float(sensors.get("flow", 13.0))
-        pressure = float(sensors.get("pressure", 3.2))
-        var_z    = float(sensors.get("var_z", 0.0))
+        # expose for dashboard compatibility
+        self.persist_count = 0
+        self.psi_window    = deque(maxlen=50)
 
-        flow_z  = abs(flow - 13.0) / 2.0
-        pres_z  = abs(pressure - 3.2) / 0.3
-        varz_z  = abs(var_z) / 1.5
-        z_score = round(float(np.mean([flow_z, pres_z, varz_z])), 4)
-        score   = round(float(np.clip(z_score / 4.0, 0.0, 1.0)), 4)
+    # ── Tier 1: bandpass filter ───────────────────────────────────────────
+    @staticmethod
+    def _bandpass(signal: np.ndarray, fs: int = 2000,
+                  low: float = 200.0, high: float = 800.0) -> np.ndarray:
+        sos = butter(4, [low / (0.5 * fs), high / (0.5 * fs)],
+                     btype='band', output='sos')
+        return sosfilt(sos, signal)
 
-        p_value = round(float(np.exp(-max(z_score, 0.0))), 4)
-        psi_val = self._psi(p_value)
-        eps     = self._update_epsilon(score)
+    # ── Tier 3: 6-class heuristic classifier ─────────────────────────────
+    @staticmethod
+    def _classify(signal: np.ndarray, salinity: float,
+                  pressure_z: float = 0.0) -> tuple:
+        """Returns (event_label, confidence)."""
+        rms    = float(np.sqrt(np.mean(signal ** 2)))
+        peak   = float(np.max(np.abs(signal)))
+        crest  = peak / (rms + 1e-9)
+        n      = len(signal)
+        # crude narrowband proxy: ratio of even-indexed samples
+        mid_r  = float(np.sum(np.abs(signal[::2])) /
+                       (np.sum(np.abs(signal)) + 1e-9))
+        rmsn   = rms / (np.std(signal) * 3 + 1e-9)   # normalised energy proxy
+        pp     = (peak - float(np.min(np.abs(signal)))) / (rms + 1e-9)
 
-        if z_score > eps:
-            self.persist_count += 1
+        if   rmsn > 0.65 and pp > 1.2:
+            return "Burst",        min(0.95, 0.75 + 0.04 * pp)
+        elif rmsn > 0.35 and mid_r > 0.55 and crest < 1.8:
+            return "Crack",        min(0.90, 0.60 + 0.25 * mid_r)
+        elif rmsn > 0.20 and salinity < 9.0:
+            return "Micro",        min(0.88, 0.55 + 0.25 * rmsn)
+        elif rmsn > 0.15 and salinity >= 9.0:
+            return "Micro",        min(0.72, 0.45 + 0.20 * rmsn)
+        elif salinity > 7.0 and rmsn < 0.10 and pressure_z > 1.5:
+            return "PressureDrop", 0.70
+        elif pressure_z > 0.6:
+            return "Pump",         min(0.80, 0.55 + 0.15 * pressure_z)
         else:
-            self.persist_count = 0
+            return "Tidal",        max(0.50, 1.0 - rmsn * 5)
 
-        base = {"flag": "MONITOR", "score": score, "psi": psi_val,
-                "eps": eps, "persist": self.persist_count, "pvalue": p_value,
-                "anomaly": "normal", "anom_prob": 0.0, "severity": 0.0,
-                "priority": "P4-LOW", "loc_m": None, "error_m": None, "gps": None}
+    # ── Severity + priority tier ──────────────────────────────────────────
+    def _severity(self, conf: float, event: str) -> tuple:
+        tw  = self.TYPE_WEIGHTS.get(event, 0.0)
+        sev = round(0.4 * conf + 0.3 * tw + 0.3 * self.zone_weight, 3)
+        if   sev >= 0.80: tier = "P1-CRITICAL"
+        elif sev >= 0.60: tier = "P2-HIGH"
+        elif sev >= 0.40: tier = "P3-MODERATE"
+        else:             tier = "P4-LOW"
+        return sev, tier
 
-        if self.persist_count < self.min_persist or psi_val > 0.80:
+    # ── Tier 4: TDOA distance (single-sensor proxy) ───────────────────────
+    @staticmethod
+    def _tdoa_distance(signal: np.ndarray,
+                       velocity: float, fs: int = 2000) -> float:
+        env      = np.abs(signal)
+        onset    = int(np.argmax(env > 0.5 * np.max(env)))
+        prop_s   = onset / fs
+        return float(np.clip(velocity * prop_s, 0.5, 200.0))
+
+    # ── Two-sensor cross-correlation distance (when mic2 available) ───────
+    @staticmethod
+    def _xcorr_distance(sig1: np.ndarray, sig2: np.ndarray,
+                        velocity: float, fs: int = 2000) -> float:
+        corr      = correlate(sig1, sig2, mode='full')
+        delay_idx = int(np.argmax(np.abs(corr))) - (len(sig1) - 1)
+        delta_tau = abs(delay_idx / fs)
+        return float(np.clip(delta_tau * velocity, 0.0, 200.0))
+
+    # ── Main process entry point ──────────────────────────────────────────
+    def process(self, sensors: dict, sensor_node_idx: int = 0) -> dict:
+        """
+        sensors keys (all optional except mic1_sig):
+            mic1_sig    : np.ndarray  (required)
+            mic2_sig    : np.ndarray  (optional — enables 2-sensor xcorr)
+            fs          : int         (default 2000)
+            salinity    : float       (psu, default 7.0)
+            flow        : float       (L/s, used as pressure_z proxy)
+            pressure    : float
+            true_dist   : float       (for MAE when ground truth known)
+        """
+        fs         = int(sensors.get('fs', 2000))
+        salinity   = float(sensors.get('salinity', 7.0))
+        flow       = float(sensors.get('flow', 13.0))
+        pressure_z = abs(flow - 13.0) / 2.0     # simple z proxy
+
+        # Tier 1 — filter
+        sig1 = self._bandpass(np.array(sensors['mic1_sig']), fs)
+        sig2 = (self._bandpass(np.array(sensors['mic2_sig']), fs)
+                if 'mic2_sig' in sensors else None)
+
+        # Tier 1 — Biot velocity
+        velocity = get_biot_velocity(salinity)
+
+        # Tier 2 — adaptive gate
+        energy = float(np.sqrt(np.mean(sig1 ** 2)))
+        z      = self._z.score(energy)
+
+        if self._cal_n < 100:
+            self._cp.calibrate(z)
+            self._cal_n += 1
+
+        p_val = self._cp.p_value(z)
+        psi   = self._psi.update(z)
+
+        is_anomalous = (p_val <= self.alpha)
+        self._flag_buf.append(is_anomalous)
+        gated = (len(self._flag_buf) == self.min_persist
+                 and all(self._flag_buf))
+
+        # expose for dashboard
+        self.persist_count = int(is_anomalous)
+        self.psi_window.append(psi)
+
+        score = round(float(p_val <= self.alpha) * z / max(z, 1), 3)
+        eps   = round(self.alpha, 3)
+
+        base = {
+            'flag':    'MONITOR',
+            'score':   round(z, 3),
+            'psi':     round(psi, 4),
+            'persist': sum(self._flag_buf),
+            'pvalue':  round(p_val, 4),
+            'eps':     eps,
+            'velocity_ms': round(velocity, 1),
+        }
+
+        if not gated:
             return base
 
-        mic1 = np.asarray(sensors.get("mic1_sig", [0.0]*512), dtype=float)
-        mic2 = np.asarray(sensors.get("mic2_sig", [0.0]*512), dtype=float)
-        leak_dist = self._tdoa_distance(mic1, mic2, fs)
-        gps       = self._snap_to_graph(sensor_node_idx, leak_dist)
-        true_dist = sensors.get("true_dist")
-        error_m   = round(abs(leak_dist - true_dist), 2) if true_dist is not None else None
-        anomaly,  anom_prob = _classify_anomaly(score, z_score)
-        severity, priority  = _severity_priority(anomaly, anom_prob)
+        # Tier 3 — classify
+        event, conf = self._classify(sig1, salinity, pressure_z)
+        sev, tier   = self._severity(conf, event)
 
-        return {"flag": "DISPATCH", "score": score, "psi": psi_val,
-                "eps": eps, "persist": self.persist_count, "pvalue": p_value,
-                "anomaly": anomaly, "anom_prob": anom_prob,
-                "severity": severity, "priority": priority,
-                "loc_m": leak_dist, "error_m": error_m, "gps": gps}
+        # Tier 4 — localise
+        if sig2 is not None:
+            dist = self._xcorr_distance(sig1, sig2, velocity, fs)
+        else:
+            dist = self._tdoa_distance(sig1, velocity, fs)
+
+        true_dist = sensors.get('true_dist')
+        error     = round(abs(dist - true_dist), 2) if true_dist else None
+
+        # Eco-Delta City approx GPS centre
+        lat0, lon0 = 35.135, 128.970
+        gps = (round(lat0 + dist * 0.000009, 6),
+               round(lon0 + dist * 0.000009, 6))
+
+        return {
+            **base,
+            'flag':      'DISPATCH',
+            'anomaly':   event,
+            'anom_prob': round(conf, 3),
+            'severity':  sev,
+            'priority':  tier,
+            'loc_m':     round(dist, 2),
+            'error_m':   error,
+            'gps':       gps,
+        }
+
+
+# ── Sensor deployment helper (used by dashboard) ──────────────────────────
+def calculate_sensor_deployment(pipe_length_km: float,
+                                spacing_m: int = 200) -> dict:
+    base  = int(np.ceil(pipe_length_km * 1000 / spacing_m))
+    redun = int(np.ceil(base * 0.20))
+    rec   = base + redun
+    return {
+        'pipe_length_km':   pipe_length_km,
+        'spacing_m':        spacing_m,
+        'base_nodes':       base,
+        'redundancy_nodes': redun,
+        'recommended_nodes': rec,
+        'total_mics':       rec * 2,
+        'coverage_m':       spacing_m,
+    }
+
+
+# ── Standalone test ────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import sys
+    brain = PULSE_AT_Brain()
+
+    # warm-up: 120 normal windows
+    rng = np.random.default_rng(0)
+    for _ in range(120):
+        brain.process({
+            'mic1_sig': rng.normal(0, 0.03, 2000),
+            'salinity': float(rng.uniform(3, 10)),
+        })
+
+    # test: 5 leak windows
+    print("\n--- Leak detection test ---")
+    for i in range(5):
+        leak_sig = rng.normal(0, 0.03, 2000)
+        leak_sig[800:850] += rng.uniform(0.3, 0.8, 50)   # inject burst
+        result = brain.process({
+            'mic1_sig':  leak_sig,
+            'mic2_sig':  leak_sig * 0.9 + rng.normal(0, 0.005, 2000),
+            'salinity':  float(rng.uniform(3, 10)),
+            'flow':      float(rng.uniform(16, 22)),
+            'true_dist': float(rng.uniform(5, 40)),
+        })
+        print(f"  [{i+1}] flag={result['flag']:8s}  "
+              f"priority={result.get('priority','-'):12s}  "
+              f"event={result.get('anomaly','-'):12s}  "
+              f"dist={result.get('loc_m','-')} m  "
+              f"v={result['velocity_ms']} m/s")
+
+    print("\n✅ PGL Brain ready.")

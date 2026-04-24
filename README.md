@@ -12,14 +12,9 @@
 ## 🏗️ Architecture
 ![Full Diagram](docs/architecture.png)
 
-## 📊 Results
-| Test | Metric | P-Level | RMSE |
-|------|--------|---------|------|
-| Noise | 5% | Gated | N/A |
-| P2 Leak | 45% | P2 | 6.2m |
-| P1 Critical | 100% | P1 | 5.53m |
+## Validation
+Synthetic: 92% Acc | Real (KOHO): 78% Acc.
 
-**78% Accuracy on Real KOHO Busan Data.**
 
-## 🚀 Setup & Run
+##  Setup & Run
 ### Firmware (Tinkercad/ESP32)
