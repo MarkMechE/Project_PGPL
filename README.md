@@ -1,7 +1,7 @@
 # PGL: Persistence-Gated Piezo Leak Detection (Busan Eco-Delta City)
 
 [![Demo Video](https://img.youtube.com/vi/demo.png)](your-demo-video)  
-**Live Tinkercad Demo**: [Click Here](YOUR-TINKERCAD-PUBLIC-LINK) – Twist RPOT1 → P2 LED Alert!
+**Live Tinkercad Demo**: [Click Here](https://www.tinkercad.com/things/0CKPvSbdaDK-piezo-sensor) – Twist RPOT1 → P2 LED Alert!
 
 ## 🎯 Quick Demo (2 Minutes)
 1. Open Tinkercad → **RPOT1 Low**: "Metric:5% | GATED Noise" (LED OFF).
