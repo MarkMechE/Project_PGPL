@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+cache/
+pulse_at_exports/
+outputs/*.csv
+outputs/*.png
+data/synthetic/*.csv
+data/real/*.csv
+data/real/*.wav

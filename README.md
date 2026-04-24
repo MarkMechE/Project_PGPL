@@ -1,20 +1,37 @@
-# PGL: Persistence-Gated Piezo Leak Detection (Busan Eco-Delta City)
+# PGL — Persistence-Gated Piezo Leak Localizer
+### Busan Eco-Delta City | Academic Prototype + Patent Filing
 
-[![Demo Video](https://img.youtube.com/vi/demo.png)](your-demo-video)  
-**Live Tinkercad Demo**: [Click Here](https://www.tinkercad.com/things/0CKPvSbdaDK-piezo-sensor) – Twist RPOT1 → P2 LED Alert!
+> Phase 1 prototype. All metrics produced by physics-informed synthetic data.
+> No proprietary or real-world sensor recordings are used.
 
-## 🎯 Quick Demo (2 Minutes)
-1. Open Tinkercad → **RPOT1 Low**: "Metric:5% | GATED Noise" (LED OFF).
-2. **Rapid Twist RPOT1**: "Metric:45% | P2 PRIORITY!" (LED ON).
-3. **RPOT2 High (Salty)**: Harder threshold test.
-4. **Serial Proof**: ![Serial Demo](docs/serial_demo.png)
+## Quick Start
+```bash
+pip install -r requirements.txt
+python run_pipeline.py        # runs simulation, prints F1 / MAE / FAR
+streamlit run dashboard/app.py  # opens GIS map
+```
 
-## 🏗️ Architecture
-![Full Diagram](docs/architecture.png)
+## Tinkercad Demo
+[Public link — paste yours here]
+Twist RPOT1: P4 Tidal → P3 Pump → P2 Micro → P1 Burst (LED ON)
 
-## Validation
-Synthetic: 92% Acc | Real (KOHO): 78% Acc.
+## Repository Layout
+| Folder | Purpose |
+|--------|---------|
+| `src/` | Core library: velocity model, signal generator, classifier, brain |
+| `hardware/` | Arduino firmware for ESP32 / Tinkercad |
+| `dashboard/` | Streamlit + Folium GIS map |
+| `data/` | `synthetic/` (generated) · `real/` (Phase 2 — BattLeDIM) |
+| `docs/` | Patent claims, architecture, validation notes |
 
+## Patent
+See `docs/patent_claims.md`. KIPRIS search April 2026: 0 water-leak hits
+for "persistence gating + piezo + salinity".
 
-##  Setup & Run
-### Firmware (Tinkercad/ESP32)
+## Phase Roadmap
+| Phase | Status | Goal |
+|-------|--------|------|
+| 1 — Prototype | ✅ Done | Tinkercad + Python simulation |
+| 2 — Validation | 🔜 Next | BattLeDIM + lab bench |
+| 3 — Patent | 🔜 Next | KIPO provisional filing |
+| 4 — Hardware | 🔜 Future | ESP32 pilot, LoRaWAN mesh |
