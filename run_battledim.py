@@ -12,6 +12,8 @@ Detection  : gate-only — DISPATCH = leak predicted
 import os
 import sys
 import argparse
+from collections import deque
+
 import numpy as np
 import pandas as pd
 
@@ -40,23 +42,7 @@ SEQ_LENGTH        = 6
 WINDOW_SIZE       = 72
 STEP              = 36
 
-
-def _get_battledim_dir():
-    try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "config", os.path.join(os.path.dirname(__file__), "config.py"))
-        cfg = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cfg)
-        base = getattr(cfg, "DATASET_ROOT", None)
-        if base:
-            return os.path.join(base, "BattLeDIM")
-    except Exception:
-        pass
-    return os.path.join(os.path.dirname(__file__), "data", "BattLeDIM")
-
-
-BATTLEDIM_DIR = _get_battledim_dir()
+BATTLEDIM_DIR = "/Users/markmontillano/Library/Mobile Documents/com~apple~CloudDocs/Project_PGPL_Dataset/BattleDIM"
 
 FILES = {
     "pressure_2019": os.path.join(BATTLEDIM_DIR, "2019_SCADA_Pressures.csv"),
@@ -67,15 +53,17 @@ FILES = {
 
 
 def compute_metrics(tp, fp, fn, tn, errors):
-    precision = tp / (tp + fp)    if (tp + fp) > 0 else 0.0
-    recall    = tp / (tp + fn)    if (tp + fn) > 0 else 0.0
+    precision = tp / (tp + fp)  if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn)  if (tp + fn) > 0 else 0.0
     f1        = (2 * precision * recall / (precision + recall)
                  if (precision + recall) > 0 else 0.0)
-    far       = fp / (fp + tn)    if (fp + tn) > 0 else 0.0
+    far       = fp / (fp + tn)  if (fp + tn) > 0 else 0.0
     mae       = float(np.mean(errors)) if errors else float("nan")
     return dict(
-        Precision=round(precision, 3), Recall=round(recall, 3),
-        F1=round(f1, 3), FAR=round(far, 3),
+        Precision=round(precision, 3),
+        Recall=round(recall, 3),
+        F1=round(f1, 3),
+        FAR=round(far, 3),
         MAE_m=round(mae, 2) if not np.isnan(mae) else "n/a",
         TP=tp, FP=fp, FN=fn, TN=tn,
     )
@@ -105,23 +93,19 @@ def _make_windows(dev_series, flow_series, label, t_start, t_end,
     return windows
 
 
-def print_metrics(m):
-    p   = m["Precision"]
-    r   = m["Recall"]
-    f1  = m["F1"]
-    far = m["FAR"]
-    tp  = m["TP"]
-    fp  = m["FP"]
-    fn  = m["FN"]
-    tn  = m["TN"]
-    print("  P=" + str(p) + "  R=" + str(r) + "  F1=" + str(f1) +
-          "  FAR=" + str(far) +
-          "  TP=" + str(tp) + "  FP=" + str(fp) +
-          "  FN=" + str(fn) + "  TN=" + str(tn))
+def _transfer_calibration(ref_brain, new_brain):
+    """
+    Copy calibration state from ref_brain to new_brain.
+    Works with the actual _AdaptiveZ API (score, _buf) and _ConformalP (_cal).
+    No freeze/unfreeze — just snapshot the buffer and cal list.
+    """
+    new_brain._cp._cal = list(ref_brain._cp._cal)
+    new_brain._cal_n   = ref_brain._cal_n
+    new_brain._z._buf  = deque(ref_brain._z._buf,
+                                maxlen=ref_brain._z._buf.maxlen)
 
 
 def run(node=None, all_nodes=False):
-    ratio_thresh = str(PULSE_AT_Brain.PERSIST_RATIO_THRESH)
     print("\n[PGL Phase 3] BattLeDIM Municipal Network Validation")
     print("  Dataset  : L-TOWN (DOI: 10.5281/zenodo.4017659)")
     print("  Calib    : 2019 Jan 1-10  (same-year clean baseline)")
@@ -132,13 +116,14 @@ def run(node=None, all_nodes=False):
     print("  Seq      : " + str(SEQ_LENGTH) + " windows = " +
           str(SEQ_LENGTH * WINDOW_SIZE * 5 // 60) + " hrs")
     print("  Gate     : persistence_n=" + str(PERSISTENCE_N) +
-          ", ratio>=" + ratio_thresh + ", alpha=" + str(ALPHA))
+          ", ratio>=" + str(PULSE_AT_Brain.PERSIST_RATIO_THRESH) +
+          ", alpha=" + str(ALPHA))
     print("  Detect   : DISPATCH = leak (gate-only)")
 
     missing = [k for k, v in FILES.items()
                if not os.path.isfile(v) and k != "ltown_inp"]
     if missing:
-        print("\n  [ERROR] Missing files in " + BATTLEDIM_DIR + ":")
+        print("\n  [ERROR] Missing files:")
         for m in missing:
             print("    " + FILES[m])
         print("  Download: https://zenodo.org/records/4017659")
@@ -150,7 +135,7 @@ def run(node=None, all_nodes=False):
     leaks_2019 = load_battledim_leakages(FILES["leakages_2019"])
 
     event_pipes = [c for c in leaks_2019.columns if c not in BACKGROUND_PIPES]
-    active_ts   = (leaks_2019[event_pipes] > 0).any(axis=1).sum()
+    active_ts   = int((leaks_2019[event_pipes] > 0).any(axis=1).sum())
     print("  2019 shape   : " + str(pres_2019.shape))
     print("  Event pipes  : " + str(len(event_pipes)) +
           " | Active timesteps: " + str(active_ts) + "/" + str(len(leaks_2019)) +
@@ -186,9 +171,9 @@ def run(node=None, all_nodes=False):
 
         leak_active = (leaks_2019[event_pipes] > 0).any(axis=1)
         leak_mask   = leak_active.reindex(
-            pressure_series.index, method="nearest").fillna(False)
+            pressure_series.index, method="nearest").fillna(False).astype(bool)
 
-        # CP calibration: Jan 1-10
+        # ── Calibration: Jan 1-10 ────────────────────────────────────────────
         calib_dev  = deviation[:CP_CALIB_END]
         calib_flow = flow_series[:CP_CALIB_END]
         calib_wins = []
@@ -204,6 +189,7 @@ def run(node=None, all_nodes=False):
                     "flow":     fv,
                 })
 
+        # Build reference brain by replaying calibration windows
         ref_brain = PULSE_AT_Brain(
             alpha=ALPHA, persistence_n=PERSISTENCE_N,
             psi_threshold=PSI_THRESHOLD, zone_weight=ZONE_WEIGHT)
@@ -212,23 +198,21 @@ def run(node=None, all_nodes=False):
             z = ref_brain._z.score(e)
             ref_brain._cp.calibrate(z)
         ref_brain._cal_n = len(calib_wins)
-        ref_brain._z.freeze()
 
         print("  CP calib : " + str(len(calib_wins)) + " windows (Jan 1-10)")
         if ref_brain._cp._cal:
-            print("  z frozen : mu=" + str(round(ref_brain._z._mu, 4)) +
-                  "  sigma=" + str(round(ref_brain._z._sigma, 4)) +
-                  "  z=[" + str(round(min(ref_brain._cp._cal), 3)) +
-                  ", " + str(round(max(ref_brain._cp._cal), 3)) + "]")
+            cal = ref_brain._cp._cal
+            print("  cal range: [" + str(round(min(cal), 3)) +
+                  ", " + str(round(max(cal), 3)) + "]  n=" + str(len(cal)))
 
-        # Normal eval: Jan 11-15
+        # ── Normal eval: Jan 11-15 ───────────────────────────────────────────
         normal_wins = _make_windows(
             deviation, flow_series, 0,
             NORMAL_EVAL_START, NORMAL_EVAL_END,
             WINDOW_SIZE, STEP, eval_node)
         normal_seqs = build_sequences(normal_wins, SEQ_LENGTH)
 
-        # Leak eval: Jan 16 onward
+        # ── Leak eval: Jan 16 onward ─────────────────────────────────────────
         leak_dev_s  = deviation[LEAK_EVAL_START:]
         leak_flow_s = flow_series[LEAK_EVAL_START:]
         leak_mask_s = leak_mask[LEAK_EVAL_START:]
@@ -265,13 +249,7 @@ def run(node=None, all_nodes=False):
             brain = PULSE_AT_Brain(
                 alpha=ALPHA, persistence_n=PERSISTENCE_N,
                 psi_threshold=PSI_THRESHOLD, zone_weight=ZONE_WEIGHT)
-            brain._cp._cal   = ref_brain._cp._cal.copy()
-            brain._cal_n     = ref_brain._cal_n
-            brain._z._frozen = ref_brain._z._frozen
-            brain._z._mu     = ref_brain._z._mu
-            brain._z._sigma  = ref_brain._z._sigma
-            brain._z._buf    = type(ref_brain._z._buf)(
-                ref_brain._z._buf, maxlen=ref_brain._z._buf.maxlen)
+            _transfer_calibration(ref_brain, brain)
 
             dispatched   = False
             final_result = None
@@ -316,13 +294,20 @@ def run(node=None, all_nodes=False):
 
         m = compute_metrics(tp, fp, fn, tn, errors)
         node_results[eval_node] = m
-        print_metrics(m)
+        print("  P=" + str(m["Precision"]) +
+              "  R=" + str(m["Recall"]) +
+              "  F1=" + str(m["F1"]) +
+              "  FAR=" + str(m["FAR"]) +
+              "  TP=" + str(m["TP"]) +
+              "  FP=" + str(m["FP"]) +
+              "  FN=" + str(m["FN"]) +
+              "  TN=" + str(m["TN"]))
 
     sep = "=" * 57
     print("\n" + sep)
     print("  RESULTS  [BattLeDIM L-TOWN — Real Municipal Network]")
     print(sep)
-    best = max(node_results, key=lambda n: node_results[n]["F1"])
+    best = max(node_results, key=lambda nd: node_results[nd]["F1"])
     print("  Best node : " + best)
     bm = node_results[best]
     for k in ["Precision", "Recall", "F1", "FAR", "MAE_m", "TP", "FP", "FN", "TN"]:

@@ -37,12 +37,12 @@ def load_battledim_pressures(filepath: str,
     Returns DataFrame indexed by Timestamp with one column per sensor node.
     Values are pressure in bar.
     """
-    df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-    df.index = pd.to_datetime(df.index, dayfirst=True)
+    df = pd.read_csv(filepath, index_col=0, parse_dates=True,
+                      sep=';', decimal=',')
+    df.index = pd.to_datetime(df.index, dayfirst=False)
     if nodes:
         available = [n for n in nodes if n in df.columns]
         df = df[available]
-    # Forward-fill short gaps (missing readings)
     df = df.ffill(limit=3)
     return df
 
@@ -53,28 +53,23 @@ def load_battledim_flows(filepath: str) -> pd.DataFrame:
     Returns DataFrame indexed by Timestamp with flow sensor columns.
     Values are flow in L/s.
     """
-    df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-    df.index = pd.to_datetime(df.index, dayfirst=True)
+    df = pd.read_csv(filepath, index_col=0, parse_dates=True,
+                      sep=';', decimal=',')
+    df.index = pd.to_datetime(df.index, dayfirst=False)
     df = df.ffill(limit=3)
     return df
 
 
 def load_battledim_leakages(filepath: str) -> pd.DataFrame:
     """
-    Load 2019_Leakages.csv — ground-truth leak events.
-    Returns DataFrame with columns:
-        LeakID, StartTime, EndTime, PipeID, LeakDemand(L/s)
+    Load 2019_Leakages.csv — timeseries matrix of leak demand per pipe.
+    Semicolon-delimited, European decimal (comma).
+    Returns DataFrame indexed by Timestamp, one column per pipe (L/s demand).
+    Non-zero value = active leak on that pipe at that timestep.
     """
-    df = pd.read_csv(filepath)
-
-    # Normalize column names (BattLeDIM uses mixed casing)
-    df.columns = [c.strip() for c in df.columns]
-
-    # Parse timestamps — BattLeDIM format: "2019-01-01 00:00"
-    for col in df.columns:
-        if "time" in col.lower() or "date" in col.lower():
-            df[col] = pd.to_datetime(df[col], dayfirst=True, errors="coerce")
-
+    df = pd.read_csv(filepath, index_col=0, sep=";", decimal=",", parse_dates=True)
+    df.index = pd.to_datetime(df.index, dayfirst=False)
+    df = df.fillna(0.0)
     return df
 
 
@@ -269,3 +264,19 @@ def get_pipe_distances(inp_filepath: str,
     except Exception as e:
         print(f"  [WARN] L-TOWN parse failed: {e}")
         return {}
+
+# ── Background (always-on) leak pipes ─────────────────────────────────────────
+BACKGROUND_PIPES = {"p31", "p102", "p186", "p229", "p280"}  # BattLeDIM 2019 known background
+
+
+# ── Pressure deviation helper ─────────────────────────────────────────────────
+def _compute_deviation(pressure_series: pd.Series,
+                       window: int = 144) -> pd.Series:
+    """
+    Rolling z-score deviation from local mean.
+    window=144 = 12 hrs at 5-min intervals (same as build_pressure_windows).
+    """
+    rolling_mean = pressure_series.rolling(window, min_periods=1).mean()
+    rolling_std  = pressure_series.rolling(window, min_periods=1).std().fillna(1.0)
+    rolling_std  = rolling_std.replace(0, 1.0)
+    return (pressure_series - rolling_mean) / rolling_std
