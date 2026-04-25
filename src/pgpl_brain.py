@@ -1,13 +1,9 @@
 """
 src/pgpl_brain.py  —  PULSE-AT Brain: Tier 2 gate + Tier 3 classify + Tier 4 localise.
 
-Fixes vs live repo
-------------------
-- c_acoustic = 1400  →  Biot-Gassmann get_biot_velocity(s)
-- fixed z > 2.0      →  adaptive rolling z + Mondrian conformal p-value
-- scale_free_graph   →  removed (placeholder; real OSMnx graph in Phase 2)
-- broken F1          →  metrics live in run_pipeline.py, not here
-- self-import crash  →  removed
+Claim 1 — Persistence gate: Persm = flagged_windows / N >= 0.67 (ratio, not unanimity)
+Claim 1 — Severity: Sev = 0.4*conf + 0.3*typeW + 0.3*zone_weight
+Tier 4  — Biot-Gassmann c(s) replaces hardcoded 1400 m/s
 """
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
@@ -54,8 +50,8 @@ class _PSIDrift:
     _BINS = np.linspace(0.0, 10.0, 11)
 
     def __init__(self, ref_window: int = 50):
-        self._ref = deque(maxlen=ref_window)
-        self._cur = deque(maxlen=ref_window)
+        self._ref   = deque(maxlen=ref_window)
+        self._cur   = deque(maxlen=ref_window)
         self._ready = False
 
     def update(self, z: float) -> float:
@@ -68,7 +64,7 @@ class _PSIDrift:
         if len(self._cur) < 10:
             return 0.0
         r, _ = np.histogram(np.array(self._ref), bins=self._BINS, density=True)
-        c, _ = np.histogram(np.array(self._cur), bins=self._BINS, density=True)
+        c, _ = np.histogram(np.array(self._cur),  bins=self._BINS, density=True)
         r, c = np.clip(r, 1e-6, None), np.clip(c, 1e-6, None)
         return float(np.sum((c - r) * np.log(c / r)))
 
@@ -77,16 +73,19 @@ class _PSIDrift:
 class PULSE_AT_Brain:
     """
     4-tier PGL pipeline brain.
-    Tier 1  bandpass filter (200–800 Hz, 2 kHz Fs)
-    Tier 2  adaptive z + Mondrian CP + PSI + N-window persistence gate
-    Tier 3  6-class heuristic classifier + P1–P4 severity scoring
-    Tier 4  TDOA distance estimate using Biot c(s)
+    Tier 1  Butterworth bandpass 200-800 Hz, 2 kHz Fs
+    Tier 2  Adaptive z + Mondrian CP + PSI + ratio persistence gate  # Claim 1
+    Tier 3  6-class heuristic classifier + P1-P4 severity scoring    # Claim 1 Eq.(1)
+    Tier 4  TDOA/xcorr distance estimate using Biot-Gassmann c(s)
     """
+
+    # Claim 1 — persistence ratio threshold (4 of 6 windows must flag)
+    PERSIST_RATIO_THRESH = 0.67
 
     def __init__(
         self,
         alpha:         float = 0.10,
-        persistence_n: int   = 3,
+        persistence_n: int   = 6,      # paper spec: 6 events
         psi_threshold: float = 0.20,
         zone_weight:   float = 0.5,
     ):
@@ -98,6 +97,7 @@ class PULSE_AT_Brain:
         self._z        = _AdaptiveZ(window=100)
         self._cp       = _MondirianCP()
         self._psi      = _PSIDrift(ref_window=50)
+        # Claim 1 — buffer holds exactly min_persist flags
         self._flag_buf = deque(maxlen=persistence_n)
         self._cal_n    = 0
 
@@ -112,7 +112,7 @@ class PULSE_AT_Brain:
                      btype="band", output="sos")
         return sosfilt(sos, sig)
 
-    # ── Tier 4: TDOA distance proxy ─────────────────────────────────────────
+    # ── Tier 4: distance estimators ─────────────────────────────────────────
     @staticmethod
     def _tdoa_distance(sig: np.ndarray, velocity: float, fs: int = 2000) -> float:
         env   = np.abs(sig)
@@ -132,11 +132,11 @@ class PULSE_AT_Brain:
         sensors keys
         ------------
         mic1_sig   np.ndarray  (required)
-        mic2_sig   np.ndarray  (optional)
+        mic2_sig   np.ndarray  (optional, enables xcorr localisation)
         fs         int         default 2000
         salinity   float       psu, default 7.0
         flow       float       L/s, default 13.0
-        true_dist  float       for MAE when ground truth is known
+        true_dist  float       ground-truth distance for MAE (optional)
         """
         fs         = int(sensors.get("fs", 2000))
         salinity   = float(sensors.get("salinity", 7.0))
@@ -146,9 +146,9 @@ class PULSE_AT_Brain:
         sig1     = self._bandpass(np.array(sensors["mic1_sig"]), fs)
         sig2     = (self._bandpass(np.array(sensors["mic2_sig"]), fs)
                     if "mic2_sig" in sensors else None)
-        velocity = get_biot_velocity(salinity)
+        velocity = get_biot_velocity(salinity)   # Biot c(s), not hardcoded 1400
 
-        # Tier 2 gate
+        # ── Tier 2 gate ──────────────────────────────────────────────────────
         energy = float(np.sqrt(np.mean(sig1 ** 2)))
         z      = self._z.score(energy)
         if self._cal_n < 100:
@@ -158,7 +158,13 @@ class PULSE_AT_Brain:
         psi   = self._psi.update(z)
 
         self._flag_buf.append(p_val <= self.alpha)
-        gated = len(self._flag_buf) == self.min_persist and all(self._flag_buf)
+
+        # Claim 1 — Persistence gate: ratio >= 0.67, NOT all() unanimity
+        # Matches paper: Persm = samples_above_thresh / N
+        gated = (
+            len(self._flag_buf) == self._flag_buf.maxlen and
+            sum(self._flag_buf) / len(self._flag_buf) >= self.PERSIST_RATIO_THRESH
+        )
 
         # Dashboard compat
         self.persist_count = int(p_val <= self.alpha)
@@ -176,11 +182,13 @@ class PULSE_AT_Brain:
         if not gated:
             return base
 
-        # Tier 3 classify
+        # ── Tier 3 classify ──────────────────────────────────────────────────
         event, conf, _ = classify(sig1, salinity, pressure_z, fs)
-        sev, tier      = severity_score(conf, event, self.zone_weight)
 
-        # Tier 4 localise
+        # Claim 1 — Eq.(1) severity
+        sev, tier = severity_score(conf, event, self.zone_weight)
+
+        # ── Tier 4 localise ──────────────────────────────────────────────────
         dist = (self._xcorr_distance(sig1, sig2, velocity, fs)
                 if sig2 is not None
                 else self._tdoa_distance(sig1, velocity, fs))
@@ -188,7 +196,7 @@ class PULSE_AT_Brain:
         true_dist = sensors.get("true_dist")
         error     = round(abs(dist - true_dist), 2) if true_dist is not None else None
 
-        # Approx GPS (EDC centre)
+        # Approx GPS offset from EDC centre (35.135N, 128.970E)
         gps = (round(35.135 + dist * 9e-6, 6), round(128.970 + dist * 9e-6, 6))
 
         return {
