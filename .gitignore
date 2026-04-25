@@ -9,3 +9,7 @@ outputs/*.png
 data/synthetic/*.csv
 data/real/*.csv
 data/real/*.wav
+# Dataset — stored in iCloud, not committed to repo
+data/real/
+outputs/*.csv
+config_local.py
