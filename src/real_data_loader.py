@@ -90,22 +90,11 @@ ACCEL_FS = 3000
 
 def load_mendeley_accelerometer(filepath: str,
                                 salinity_psu: float = SALINITY_MEAN_PSU) -> dict:
-    """
-    Load one Mendeley accelerometer CSV.
-
-    File format (2-column, no header):
-        col 0: timestamp (s)
-        col 1: acceleration (g or m/s²)
-
-    Returns dict ready for PULSE_AT_Brain.process().
-    """
     label = _parse_label(filepath)
 
-    df = pd.read_csv(filepath, header=None)
-    if df.shape[1] >= 2:
-        signal = df.iloc[:, 1].values.astype(float)
-    else:
-        signal = df.iloc[:, 0].values.astype(float)
+    df = pd.read_csv(filepath, header=0, low_memory=False)   # skip "Value" header
+    # After reading with header, the signal is in the first (and only) data column
+    signal = pd.to_numeric(df.iloc[:, 0], errors='coerce').dropna().values.astype(float)
 
     signal = _normalize(_resample(signal, ACCEL_FS, FS))
 
@@ -120,34 +109,15 @@ def load_mendeley_accelerometer(filepath: str,
     }
 
 
-# ── Dynamic Pressure Sensor loader ────────────────────────────────────────
-# Mendeley pressure sensor fs: 100 Hz (per dataset spec)
-PRESSURE_FS = 100
-
 def load_mendeley_pressure(filepath: str,
                            salinity_psu: float = SALINITY_MEAN_PSU) -> dict:
-    """
-    Load one Mendeley dynamic pressure sensor CSV.
-
-    File format (2-column, no header):
-        col 0: timestamp (s)
-        col 1: pressure (bar or kPa — check dataset README)
-
-    Used as pressure_z proxy in PULSE_AT_Brain (flow deviation → pressure anomaly).
-    Returns dict with both mic1_sig (for pipeline) and raw_pressure.
-    """
     label = _parse_label(filepath)
 
-    df = pd.read_csv(filepath, header=None)
-    if df.shape[1] >= 2:
-        pressure = df.iloc[:, 1].values.astype(float)
-    else:
-        pressure = df.iloc[:, 0].values.astype(float)
+    df = pd.read_csv(filepath, header=0, low_memory=False)
+    pressure = pd.to_numeric(df.iloc[:, 0], errors='coerce').dropna().values.astype(float)
 
-    # Upsample to FS so it can be fused with acoustic signal
     signal = _normalize(_resample(pressure, PRESSURE_FS, FS))
 
-    # Derive a flow-proxy: deviation from mean maps to pressure_z
     pressure_mean = float(np.mean(pressure))
     pressure_std  = float(np.std(pressure)) + 1e-9
     pressure_z    = float(np.mean(np.abs(pressure - pressure_mean) / pressure_std))
@@ -156,15 +126,13 @@ def load_mendeley_pressure(filepath: str,
         "mic1_sig":     signal,
         "fs":           FS,
         "salinity":     salinity_psu,
-        "flow":         13.0 - pressure_z * 2.0,   # maps pressure_z → flow proxy
+        "flow":         13.0 - pressure_z * 2.0,
         "label":        label,
         "is_leak":      label in LEAK_CLASSES,
         "source_file":  os.path.basename(filepath),
         "sensor_type":  "pressure",
         "pressure_z":   round(pressure_z, 4),
     }
-
-
 # ── Hydrophone loader ──────────────────────────────────────────────────────
 # Mendeley hydrophone fs: 8000 Hz (per dataset spec)
 HYDRO_FS = 8000
