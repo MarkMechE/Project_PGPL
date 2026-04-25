@@ -105,25 +105,42 @@ def _make_windows(dev_series, flow_series, label, t_start, t_end,
     return windows
 
 
+def print_metrics(m):
+    p   = m["Precision"]
+    r   = m["Recall"]
+    f1  = m["F1"]
+    far = m["FAR"]
+    tp  = m["TP"]
+    fp  = m["FP"]
+    fn  = m["FN"]
+    tn  = m["TN"]
+    print("  P=" + str(p) + "  R=" + str(r) + "  F1=" + str(f1) +
+          "  FAR=" + str(far) +
+          "  TP=" + str(tp) + "  FP=" + str(fp) +
+          "  FN=" + str(fn) + "  TN=" + str(tn))
+
+
 def run(node=None, all_nodes=False):
+    ratio_thresh = str(PULSE_AT_Brain.PERSIST_RATIO_THRESH)
     print("\n[PGL Phase 3] BattLeDIM Municipal Network Validation")
-    print(f"  Dataset  : L-TOWN (DOI: 10.5281/zenodo.4017659)")
-    print(f"  Calib    : 2019 Jan 1-10  (same-year clean baseline)")
-    print(f"  Normal   : 2019 Jan 11-15 (held-out normal eval)")
-    print(f"  Leak eval: 2019 Jan 16 onward")
-    print(f"  Salinity : {SALINITY_MEAN_PSU} psu (Lee et al. 2023)")
-    print(f"  Window   : {WINDOW_SIZE} x 5 min = {WINDOW_SIZE * 5} min")
-    print(f"  Seq      : {SEQ_LENGTH} windows = {SEQ_LENGTH * WINDOW_SIZE * 5 // 60} hrs")
-    print(f"  Gate     : persistence_n={PERSISTENCE_N}, "
-          f"ratio>={PULSE_AT_Brain.PERSIST_RATIO_THRESH}, alpha={ALPHA}")
-    print(f"  Detect   : DISPATCH = leak (gate-only)")
+    print("  Dataset  : L-TOWN (DOI: 10.5281/zenodo.4017659)")
+    print("  Calib    : 2019 Jan 1-10  (same-year clean baseline)")
+    print("  Normal   : 2019 Jan 11-15 (held-out normal eval)")
+    print("  Leak eval: 2019 Jan 16 onward")
+    print("  Salinity : " + str(SALINITY_MEAN_PSU) + " psu (Lee et al. 2023)")
+    print("  Window   : " + str(WINDOW_SIZE) + " x 5 min = " + str(WINDOW_SIZE * 5) + " min")
+    print("  Seq      : " + str(SEQ_LENGTH) + " windows = " +
+          str(SEQ_LENGTH * WINDOW_SIZE * 5 // 60) + " hrs")
+    print("  Gate     : persistence_n=" + str(PERSISTENCE_N) +
+          ", ratio>=" + ratio_thresh + ", alpha=" + str(ALPHA))
+    print("  Detect   : DISPATCH = leak (gate-only)")
 
     missing = [k for k, v in FILES.items()
                if not os.path.isfile(v) and k != "ltown_inp"]
     if missing:
-        print(f"\n  [ERROR] Missing files in {BATTLEDIM_DIR}:")
+        print("\n  [ERROR] Missing files in " + BATTLEDIM_DIR + ":")
         for m in missing:
-            print(f"    {FILES[m]}")
+            print("    " + FILES[m])
         print("  Download: https://zenodo.org/records/4017659")
         sys.exit(1)
 
@@ -134,10 +151,10 @@ def run(node=None, all_nodes=False):
 
     event_pipes = [c for c in leaks_2019.columns if c not in BACKGROUND_PIPES]
     active_ts   = (leaks_2019[event_pipes] > 0).any(axis=1).sum()
-    print(f"  2019 shape   : {pres_2019.shape}")
-    print(f"  Event pipes  : {len(event_pipes)} | "
-          f"Active timesteps: {active_ts}/{len(leaks_2019)} "
-          f"({100 * active_ts / len(leaks_2019):.1f}%)")
+    print("  2019 shape   : " + str(pres_2019.shape))
+    print("  Event pipes  : " + str(len(event_pipes)) +
+          " | Active timesteps: " + str(active_ts) + "/" + str(len(leaks_2019)) +
+          " (" + str(round(100 * active_ts / len(leaks_2019), 1)) + "%)")
 
     available_nodes = list(pres_2019.columns)
     if all_nodes:
@@ -149,7 +166,7 @@ def run(node=None, all_nodes=False):
         if not nodes_to_run:
             nodes_to_run = list(
                 pres_2019.std().sort_values(ascending=False).index[:3])
-    print(f"  Nodes        : {nodes_to_run}")
+    print("  Nodes        : " + str(nodes_to_run))
 
     pipe_distances = {}
     if os.path.isfile(FILES["ltown_inp"]):
@@ -159,7 +176,7 @@ def run(node=None, all_nodes=False):
     node_results = {}
 
     for eval_node in nodes_to_run:
-        print(f"\n  === Node: {eval_node} ===")
+        print("\n  === Node: " + eval_node + " ===")
 
         pressure_series = pres_2019[eval_node].dropna()
         flow_col        = flow_2019.columns[0]
@@ -197,12 +214,12 @@ def run(node=None, all_nodes=False):
         ref_brain._cal_n = len(calib_wins)
         ref_brain._z.freeze()
 
-        print(f"  CP calib : {len(calib_wins)} windows (Jan 1-10)")
+        print("  CP calib : " + str(len(calib_wins)) + " windows (Jan 1-10)")
         if ref_brain._cp._cal:
-            print(f"  z frozen : mu={ref_brain._z._mu:.4f}  "
-                  f"sigma={ref_brain._z._sigma:.4f}  "
-                  f"z=[{min(ref_brain._cp._cal):.3f}, "
-                  f"{max(ref_brain._cp._cal):.3f}]")
+            print("  z frozen : mu=" + str(round(ref_brain._z._mu, 4)) +
+                  "  sigma=" + str(round(ref_brain._z._sigma, 4)) +
+                  "  z=[" + str(round(min(ref_brain._cp._cal), 3)) +
+                  ", " + str(round(max(ref_brain._cp._cal), 3)) + "]")
 
         # Normal eval: Jan 11-15
         normal_wins = _make_windows(
@@ -235,10 +252,11 @@ def run(node=None, all_nodes=False):
             })
         leak_seqs = build_sequences(leak_wins, SEQ_LENGTH)
 
-        all_seqs  = normal_seqs + leak_seqs
-        n_lk      = sum(1 for s in all_seqs if s["is_leak"])
-        n_nm      = len(all_seqs) - n_lk
-        print(f"  Sequences: {len(all_seqs)} | normal={n_nm} | leak={n_lk}")
+        all_seqs = normal_seqs + leak_seqs
+        n_lk     = sum(1 for s in all_seqs if s["is_leak"])
+        n_nm     = len(all_seqs) - n_lk
+        print("  Sequences: " + str(len(all_seqs)) +
+              " | normal=" + str(n_nm) + " | leak=" + str(n_lk))
 
         tp = fp = fn = tn = 0
         errors = []
@@ -289,42 +307,52 @@ def run(node=None, all_nodes=False):
                 "true_label": true_label,
                 "dispatched": dispatched,
                 "pred_leak":  is_leak_pred,
-                "anomaly":    final_result.get("anomaly", "—")  if final_result else "—",
-                "severity":   final_result.get("severity", "—") if final_result else "—",
-                "priority":   final_result.get("priority", "—") if final_result else "—",
-                "z_score":    final_result.get("score", "—")    if final_result else "—",
-                "pvalue":     final_result.get("pvalue", "—")   if final_result else "—",
+                "anomaly":    final_result.get("anomaly", "")  if final_result else "",
+                "severity":   final_result.get("severity", "") if final_result else "",
+                "priority":   final_result.get("priority", "") if final_result else "",
+                "z_score":    final_result.get("score", "")    if final_result else "",
+                "pvalue":     final_result.get("pvalue", "")   if final_result else "",
             })
 
         m = compute_metrics(tp, fp, fn, tn, errors)
         node_results[eval_node] = m
-        print(f"  P={m["Precision"]}  R={m["Recall"]}  F1={m["F1"]}  "
-              f"FAR={m["FAR"]}  "
-              f"TP={m["TP"]}  FP={m["FP"]}  FN={m["FN"]}  TN={m["TN"]}")
+        print_metrics(m)
 
-    print("\n" + "=" * 57)
+    sep = "=" * 57
+    print("\n" + sep)
     print("  RESULTS  [BattLeDIM L-TOWN — Real Municipal Network]")
-    print("=" * 57)
+    print(sep)
     best = max(node_results, key=lambda n: node_results[n]["F1"])
-    print(f"  Best node : {best}")
-    for k, v in node_results[best].items():
-        print(f"  {k:<14}: {v}")
+    print("  Best node : " + best)
+    bm = node_results[best]
+    for k in ["Precision", "Recall", "F1", "FAR", "MAE_m", "TP", "FP", "FN", "TN"]:
+        print("  " + k.ljust(14) + ": " + str(bm[k]))
     if len(nodes_to_run) > 1:
         print("\n  Per-node:")
-        print(f"  {"Node":<8} {"F1":>6} {"Recall":>8} {"FAR":>8} "
-              f"{"TP":>5} {"FP":>5} {"FN":>5} {"TN":>5}")
+        print("  " + "Node".ljust(8) + "F1".rjust(6) +
+              "Recall".rjust(8) + "FAR".rjust(8) +
+              "TP".rjust(5) + "FP".rjust(5) +
+              "FN".rjust(5) + "TN".rjust(5))
         print("  " + "-" * 52)
-        for n, m in node_results.items():
-            print(f"  {n:<8} {m["F1"]:>6} {m["Recall"]:>8} {m["FAR"]:>8} "
-                  f"{m["TP"]:>5} {m["FP"]:>5} {m["FN"]:>5} {m["TN"]:>5}")
-    print("=" * 57)
-    print(f"  Salinity : Lee et al. (2023) DOI:10.1016/j.margeo.2023.107089")
-    print(f"  Dataset  : Vrachimis et al. (2022) DOI:10.5281/zenodo.4017659")
+        for nd, m in node_results.items():
+            print("  " + nd.ljust(8) +
+                  str(m["F1"]).rjust(6) +
+                  str(m["Recall"]).rjust(8) +
+                  str(m["FAR"]).rjust(8) +
+                  str(m["TP"]).rjust(5) +
+                  str(m["FP"]).rjust(5) +
+                  str(m["FN"]).rjust(5) +
+                  str(m["TN"]).rjust(5))
+    print(sep)
+    print("  Salinity : Lee et al. (2023) DOI:10.1016/j.margeo.2023.107089")
+    print("  Dataset  : Vrachimis et al. (2022) DOI:10.5281/zenodo.4017659")
+    print("  Note     : Gate-only detection. Classifier logs anomaly class")
+    print("             but RMS distributions overlap in class space.")
 
     os.makedirs("outputs", exist_ok=True)
     out = "outputs/battledim_results.csv"
     pd.DataFrame(all_records).to_csv(out, index=False)
-    print(f"\n  Saved: {out}\n")
+    print("\n  Saved: " + out + "\n")
 
 
 if __name__ == "__main__":
