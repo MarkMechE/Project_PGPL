@@ -149,8 +149,15 @@ class PULSE_AT_Brain:
         velocity = get_biot_velocity(salinity)   # Biot c(s), not hardcoded 1400
 
         # ── Tier 2 gate ──────────────────────────────────────────────────────
-        energy = float(np.sqrt(np.mean(sig1 ** 2)))
-        z      = self._z.score(energy)
+        # Use bandpass energy ratio (200-800 Hz / total) as anomaly feature.
+        # Raw RMS is blind to leak type — leak signatures are spectral, not amplitude.
+        from scipy.signal import welch
+        freqs, psd = welch(sig1, fs=fs, nperseg=min(256, len(sig1)))
+        total_power = float(np.sum(psd)) + 1e-12
+        band_mask   = (freqs >= 200) & (freqs <= 800)
+        band_power  = float(np.sum(psd[band_mask]))
+        energy      = band_power / total_power   # ratio 0-1
+        z           = self._z.score(energy)
         if self._cal_n < 100:
             self._cp.calibrate(z)
             self._cal_n += 1

@@ -102,7 +102,7 @@ def load_mendeley_accelerometer(filepath: str,
                                 salinity_psu: float = SALINITY_MEAN_PSU) -> dict:
     label  = _parse_label(filepath)
     signal = _read_mendeley_csv(filepath)
-    signal = _normalize(_resample(signal, ACCEL_FS, FS))
+    signal = _resample(signal, ACCEL_FS, FS)  # NO normalize — brain needs raw amplitude
     return {
         "mic1_sig":    signal,
         "fs":          FS,
@@ -125,7 +125,7 @@ def load_mendeley_pressure(filepath: str,
     pressure_z = float(np.mean(np.abs(pressure - p_mean) / p_std))
     flow_proxy = float(np.clip(13.0 - pressure_z * 2.0, 0.0, 30.0))
 
-    signal = _normalize(_resample(pressure, PRESSURE_FS, FS))
+    signal = _resample(pressure, PRESSURE_FS, FS)  # NO normalize
     return {
         "mic1_sig":    signal,
         "fs":          FS,
