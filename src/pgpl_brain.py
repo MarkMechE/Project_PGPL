@@ -108,8 +108,14 @@ class PULSE_AT_Brain:
     # ── Tier 1: bandpass ────────────────────────────────────────────────────
     @staticmethod
     def _bandpass(sig: np.ndarray, fs: int = 2000) -> np.ndarray:
-        sos = butter(4, [200 / (0.5 * fs), 800 / (0.5 * fs)],
-                     btype="band", output="sos")
+        # Bandpass only valid for acoustic signals (fs >= 2000 Hz).
+        # Pressure/SCADA signals (fs=1) pass through unchanged.
+        nyq = 0.5 * fs
+        lo  = 200 / nyq
+        hi  = 800 / nyq
+        if lo >= 1.0 or hi >= 1.0 or lo <= 0.0:
+            return sig.astype(np.float32)
+        sos = butter(4, [lo, hi], btype="band", output="sos")
         return sosfilt(sos, sig)
 
     # ── Tier 4: distance estimators ─────────────────────────────────────────
@@ -158,7 +164,7 @@ class PULSE_AT_Brain:
         band_power  = float(np.sum(psd[band_mask]))
         energy      = band_power / total_power   # ratio 0-1
         z           = self._z.score(energy)
-        if self._cal_n < 100:
+        if self._cal_n < 500:
             self._cp.calibrate(z)
             self._cal_n += 1
         p_val = self._cp.p_value(z)

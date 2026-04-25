@@ -149,9 +149,31 @@ def run():
     print(f"  Salinity: {'random [3-10] psu' if args.random_salinity else 'fixed 7.0 psu'}")
     print(f"  Gate    : persistence_n={PERSISTENCE_N}, ratio>={0.67}, alpha={ALPHA}\n")
 
-    # 1. Warm-up CP on ALL normal samples (always, regardless of eval mode)
-    print(f"  Warming up CP on all sensor normal samples ({N_WARMUP} windows)...")
-    ref_brain = warmup_brain(N_WARMUP)
+    # 1. Load ALL sensor types for warm-up calibration
+    print(f"  Loading all sensors for CP warm-up...")
+    all_samples = load_real_dataset(
+        use_accelerometer=True,
+        use_pressure=True,
+        use_hydrophone=use_hydro,
+        rng=None,
+        verbose=False,
+    )
+    normal_sigs = [s["mic1_sig"] for s in all_samples if not s["is_leak"]]
+    print(f"  Warming up CP on {len(normal_sigs)} normal recordings ({N_WARMUP} windows)...")
+    ref_brain = PULSE_AT_Brain(alpha=ALPHA, persistence_n=PERSISTENCE_N,
+                               psi_threshold=PSI_THRESHOLD, zone_weight=ZONE_WEIGHT)
+    count = 0
+    idx = 0
+    while count < N_WARMUP and len(normal_sigs) > 0:
+        sig = normal_sigs[idx % len(normal_sigs)]
+        for start in range(0, len(sig) - FS, FS):
+            chunk = sig[start: start + FS]
+            ref_brain.process({"mic1_sig": chunk, "fs": FS, "salinity": 7.0})
+            count += 1
+            if count >= N_WARMUP:
+                break
+        idx += 1
+    print(f"  CP warm-up: {ref_brain._cal_n} calibration points.")
 
     # 2. Load eval samples (only selected sensor types)
     print(f"\n  Loading eval samples...")

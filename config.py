@@ -25,7 +25,7 @@ SALINITY_RANGE_PSU = (3.0, 10.0)
 
 # ── Pipeline constants ─────────────────────────────────────────────────────
 FS               = 2000    # Hz — resample target for classifier
-ALPHA            = 0.10    # Mondrian CP significance level
+ALPHA            = 0.05    # Mondrian CP significance level
 PERSISTENCE_N    = 6       # windows per evaluation block
 PERSIST_RATIO    = 0.67    # Claim 1: ≥ 4/6 windows must flag
 PSI_THRESHOLD    = 0.20
@@ -34,3 +34,4 @@ ZONE_WEIGHT      = 0.5     # default; override per pipe segment if known
 # ── Output paths ───────────────────────────────────────────────────────────
 OUTPUTS_DIR      = "outputs"
 RESULTS_CSV      = os.path.join(OUTPUTS_DIR, "real_data_results.csv")
+BATTLEDIM_DIR = os.path.join(DATASET_ROOT, "BattLeDIM")
