@@ -154,7 +154,7 @@ class PULSE_AT_Brain:
         from scipy.signal import welch
         freqs, psd = welch(sig1, fs=fs, nperseg=min(256, len(sig1)))
         total_power = float(np.sum(psd)) + 1e-12
-        band_mask   = (freqs >= 200) & (freqs <= 800)
+        band_mask   = (freqs >= 100) & (freqs <= 600)
         band_power  = float(np.sum(psd[band_mask]))
         energy      = band_power / total_power   # ratio 0-1
         z           = self._z.score(energy)

@@ -104,6 +104,20 @@ def load_mendeley_accelerometer(filepath: str,
     signal = _read_mendeley_csv(filepath)
     signal = _resample(signal, ACCEL_FS, FS)  # NO normalize — brain needs raw amplitude
     return {
+    # Trim transients: skip first 30s (pump startup)
+    trim_start = int(30 * FS)
+    if len(signal) > trim_start:
+        signal = signal[trim_start:]
+    else:
+        raise ValueError("Signal too short after trim (<30s)")
+
+    # Trim transients: skip first 30s (pump startup)
+    trim_start = int(30 * FS)
+    if len(signal) > trim_start:
+        signal = signal[trim_start:]
+    else:
+        raise ValueError("Signal too short after trim (<30s)")
+
         "mic1_sig":    signal,
         "fs":          FS,
         "salinity":    salinity_psu,
@@ -127,6 +141,20 @@ def load_mendeley_pressure(filepath: str,
 
     signal = _resample(pressure, PRESSURE_FS, FS)  # NO normalize
     return {
+    # Trim transients: skip first 30s (pump startup)
+    trim_start = int(30 * FS)
+    if len(signal) > trim_start:
+        signal = signal[trim_start:]
+    else:
+        raise ValueError("Signal too short after trim (<30s)")
+
+    # Trim transients: skip first 30s (pump startup)
+    trim_start = int(30 * FS)
+    if len(signal) > trim_start:
+        signal = signal[trim_start:]
+    else:
+        raise ValueError("Signal too short after trim (<30s)")
+
         "mic1_sig":    signal,
         "fs":          FS,
         "salinity":    salinity_psu,
