@@ -30,6 +30,10 @@ from config import (
     SALINITY_MEAN_PSU, SALINITY_RANGE_PSU, FS,
 )
 
+ACCEL_FS    = 3000
+PRESSURE_FS = 100
+HYDRO_FS    = 8000
+
 # ── Label mapping ──────────────────────────────────────────────────────────
 # Maps Mendeley filename codes → PGL classifier class names
 # Mendeley naming: <pipe_type>_<leak_code>_<flow>LPS_<sensor_id>.csv

@@ -3,16 +3,17 @@ run_pipeline.py  —  PULSE-AT Phase 2: Real data evaluation (Mendeley Testbed)
 
 Dataset : "Acoustic leak detection in water pipe" (Mendeley Data)
           DOI: 10.17632/tbrnp6vrnj/1
-Salinity: Nakdong EDC aquifer brackish zone 3–10 psu
+Salinity: Nakdong EDC aquifer brackish zone 3-10 psu
           (Lee et al. 2023, Marine Geology, DOI: 10.1016/j.margeo.2023.107089)
 
 NOTE: Results are from real acoustic sensor recordings on a 47 m PVC testbed.
-      Ground-truth leak labels are provided by the dataset authors.
-      Localization MAE is not reported (no true_dist in Mendeley data).
+      Ground-truth leak labels provided by dataset authors.
+      Localization MAE not reported (no true_dist in Mendeley data).
 
 Usage:
-    python run_pipeline.py
-    python run_pipeline.py --pressure-only
+    python run_pipeline.py                  # accel + pressure
+    python run_pipeline.py --accel-only     # accelerometer only
+    python run_pipeline.py --pressure-only  # pressure only
     python run_pipeline.py --random-salinity
 """
 
@@ -33,16 +34,13 @@ from src.real_data_loader import load_real_dataset
 
 # ── CLI args ───────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="PULSE-AT real data evaluation")
-parser.add_argument("--accel-only",     action="store_true")
-parser.add_argument("--pressure-only",  action="store_true")
-parser.add_argument("--hydro",          action="store_true",
-                    help="Include hydrophone (requires soundfile)")
-parser.add_argument("--random-salinity", action="store_true",
-                    help="Draw salinity from [3–10 psu] range per sample")
-parser.add_argument("--seq-len", type=int, default=12,
-                    help="Windows per sequence for persistence gate (default 12)")
-parser.add_argument("--warmup",  type=int, default=120,
-                    help="CP warm-up windows (default 120)")
+parser.add_argument("--accel-only",      action="store_true")
+parser.add_argument("--pressure-only",   action="store_true")
+parser.add_argument("--hydro",           action="store_true")
+parser.add_argument("--random-salinity", action="store_true")
+parser.add_argument("--seq-len", type=int, default=6,
+                    help="Windows per sequence (default 6 = persistence_n)")
+parser.add_argument("--warmup",  type=int, default=120)
 args = parser.parse_args()
 
 SEQ_LEN  = args.seq_len
@@ -56,11 +54,11 @@ use_hydro    = args.hydro
 
 # ── Metrics ────────────────────────────────────────────────────────────────
 def compute_metrics(tp, fp, fn, tn) -> dict:
-    precision = tp / (tp + fp)   if (tp + fp) > 0 else 0.0
-    recall    = tp / (tp + fn)   if (tp + fn) > 0 else 0.0
+    precision = tp / (tp + fp)  if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn)  if (tp + fn) > 0 else 0.0
     f1        = (2 * precision * recall / (precision + recall)
                  if (precision + recall) > 0 else 0.0)
-    far       = fp / (fp + tn)   if (fp + tn) > 0 else 0.0
+    far       = fp / (fp + tn)  if (fp + tn) > 0 else 0.0
     return dict(
         Precision=round(precision, 3),
         Recall=round(recall, 3),
@@ -70,69 +68,71 @@ def compute_metrics(tp, fp, fn, tn) -> dict:
     )
 
 
-# ── Warm-up: calibrate Mondrian CP on normal (NL) samples ─────────────────
-def warmup_brain(samples: list, n: int = N_WARMUP) -> PULSE_AT_Brain:
+# ── Warm-up ────────────────────────────────────────────────────────────────
+def warmup_brain(n_requested: int = N_WARMUP) -> PULSE_AT_Brain:
     """
-    Run n normal-condition windows through a single brain to warm up the
-    Mondrian conformal predictor calibration set.
-    Returns the calibrated brain (its _cp._cal is copied to eval brains).
+    Always loads ALL sensor types for warm-up regardless of eval mode.
+    This maximises normal-condition calibration samples.
+    Warm-up brain's CP cal is transferred to every eval brain.
     """
-    normal_sigs = [
-        s["mic1_sig"] for s in samples
-        if not s["is_leak"] and len(s["mic1_sig"]) > 0
-    ]
-    if len(normal_sigs) < n:
-        print(f"  [WARN] Only {len(normal_sigs)} normal samples for warm-up "
-              f"(requested {n}). Using all.")
-        n = len(normal_sigs)
+    # Load all sensors for warm-up (accel + pressure + hydro if available)
+    all_samples = load_real_dataset(
+        use_accelerometer=True,
+        use_pressure=True,
+        use_hydrophone=use_hydro,
+        rng=None,           # fixed salinity for reproducible calibration
+        verbose=False,
+    )
+
+    normal_sigs = [s["mic1_sig"] for s in all_samples if not s["is_leak"]]
 
     brain = PULSE_AT_Brain(alpha=ALPHA, persistence_n=PERSISTENCE_N,
                            psi_threshold=PSI_THRESHOLD, zone_weight=ZONE_WEIGHT)
-    _rng = np.random.default_rng(0)
-    for i in range(n):
-        sig = normal_sigs[i % len(normal_sigs)]
-        # Chunk into windows of 1 s for warm-up
-        window_size = FS
+
+    if len(normal_sigs) == 0:
+        print("  [WARN] No normal samples found for warm-up — CP uncalibrated.")
+        return brain
+
+    # Cycle through normal recordings, feeding 1-second windows
+    count = 0
+    window_size = FS
+    idx = 0
+    while count < n_requested:
+        sig = normal_sigs[idx % len(normal_sigs)]
         for start in range(0, len(sig) - window_size, window_size):
             chunk = sig[start: start + window_size]
             brain.process({"mic1_sig": chunk, "fs": FS, "salinity": 7.0})
+            count += 1
+            if count >= n_requested:
+                break
+        idx += 1
 
-    print(f"  CP warm-up: {brain._cal_n} calibration points accumulated.")
+    print(f"  CP warm-up: {brain._cal_n} calibration points from "
+          f"{len(normal_sigs)} normal recordings.")
     return brain
 
 
 # ── Sequence builder ───────────────────────────────────────────────────────
-def _chunk_signal(signal: np.ndarray, window_s: float = 1.0,
-                  fs: int = FS) -> list:
-    """Split a full recording into non-overlapping 1-second windows."""
-    win = int(window_s * fs)
-    return [signal[i: i + win]
-            for i in range(0, len(signal) - win, win)]
+def _chunk_signal(signal: np.ndarray, fs: int = FS) -> list:
+    """Split full recording into non-overlapping 1-second windows."""
+    win = int(fs)
+    return [signal[i: i + win] for i in range(0, len(signal) - win, win)]
 
 
-def build_sequences(samples: list, seq_len: int = SEQ_LEN) -> list:
+def build_sequences(samples: list) -> list:
     """
-    Each sample (full recording) → one sequence of seq_len consecutive windows.
-    Sequences shorter than seq_len are zero-padded at start.
-
-    Returns list of dicts:
-        windows, label (0/1), salinity_psu, sensor_type, source_file
+    Each Mendeley recording → sliding windows fed sequentially to one brain.
+    The brain accumulates flags across ALL windows (not just last seq_len).
+    A DISPATCH at any window = positive prediction for that recording.
+    seq_len is used as the minimum windows before gate can fire.
     """
     sequences = []
     for s in samples:
         chunks = _chunk_signal(s["mic1_sig"], fs=s["fs"])
-        if len(chunks) == 0:
+        if len(chunks) < 2:
             continue
-        # Take the last seq_len chunks (most likely to contain leak transient)
-        if len(chunks) >= seq_len:
-            windows = chunks[-seq_len:]
-        else:
-            # Pad with first chunk repeated
-            pad = [chunks[0]] * (seq_len - len(chunks))
-            windows = pad + chunks
-
         sequences.append({
-            "windows":      windows,
+            "windows":      chunks,          # ALL windows, not truncated
             "label":        int(s["is_leak"]),
             "salinity_psu": s["salinity"],
             "sensor_type":  s.get("sensor_type", "unknown"),
@@ -146,10 +146,15 @@ def build_sequences(samples: list, seq_len: int = SEQ_LEN) -> list:
 def run():
     print("\n[PULSE-AT] Phase 2 — Real Data Evaluation (Mendeley Testbed)")
     print(f"  Sensors : accel={use_accel}, pressure={use_pressure}, hydro={use_hydro}")
-    print(f"  Salinity: {'random [3–10] psu' if args.random_salinity else 'fixed 7.0 psu'}")
-    print(f"  Seq len : {SEQ_LEN} windows × 1 s | FS: {FS} Hz\n")
+    print(f"  Salinity: {'random [3-10] psu' if args.random_salinity else 'fixed 7.0 psu'}")
+    print(f"  Gate    : persistence_n={PERSISTENCE_N}, ratio>={0.67}, alpha={ALPHA}\n")
 
-    # 1. Load real data
+    # 1. Warm-up CP on ALL normal samples (always, regardless of eval mode)
+    print(f"  Warming up CP on all sensor normal samples ({N_WARMUP} windows)...")
+    ref_brain = warmup_brain(N_WARMUP)
+
+    # 2. Load eval samples (only selected sensor types)
+    print(f"\n  Loading eval samples...")
     samples = load_real_dataset(
         use_accelerometer=use_accel,
         use_pressure=use_pressure,
@@ -159,18 +164,13 @@ def run():
     )
     if len(samples) == 0:
         print("\n  [ERROR] No samples loaded. Check DATASET_ROOT in config.py.")
-        print("  Make sure iCloud files are fully downloaded (no .icloud placeholders).")
         sys.exit(1)
 
-    # 2. Warm-up
-    print(f"\n  Warming up CP ({N_WARMUP} normal windows)...")
-    ref_brain = warmup_brain(samples, N_WARMUP)
-
     # 3. Build sequences
-    sequences = build_sequences(samples, SEQ_LEN)
-    print(f"\n  Sequences built: {len(sequences)} total")
+    sequences = build_sequences(samples)
+    print(f"\n  Sequences: {len(sequences)} recordings → all windows fed sequentially")
 
-    # 4. Evaluate
+    # 4. Evaluate — one fresh brain per recording
     tp = fp = fn = tn = 0
     records = []
 
@@ -179,7 +179,7 @@ def run():
         salinity   = seq["salinity_psu"]
         flow       = seq["flow"]
 
-        # Fresh brain per sequence; transfer CP calibration from warmup
+        # Fresh brain per recording; transfer CP calibration from warmup
         brain = PULSE_AT_Brain(alpha=ALPHA, persistence_n=PERSISTENCE_N,
                                psi_threshold=PSI_THRESHOLD, zone_weight=ZONE_WEIGHT)
         brain._cp._cal = ref_brain._cp._cal.copy()
@@ -191,17 +191,18 @@ def run():
         dispatched   = False
         final_result = None
 
+        # Feed ALL windows — gate fires when ratio >= 0.67 across buffer
         for win in seq["windows"]:
             result = brain.process({
                 "mic1_sig": win,
                 "fs":       FS,
                 "salinity": salinity,
                 "flow":     flow,
-                # no true_dist → error_m = None (honest; Mendeley has no GT distance)
             })
             if result["flag"] == "DISPATCH" and not dispatched:
                 dispatched   = True
                 final_result = result
+                # Don't break — let remaining windows run for PSI tracking
 
         is_leak_pred = (dispatched and
                         final_result is not None and
@@ -218,44 +219,54 @@ def run():
             "sensor_type":  seq["sensor_type"],
             "true_label":   true_label,
             "salinity_psu": round(salinity, 2),
+            "n_windows":    len(seq["windows"]),
             "dispatched":   dispatched,
             "pred_leak":    is_leak_pred,
-            "anomaly":      final_result.get("anomaly",  "—") if final_result else "—",
-            "priority":     final_result.get("priority", "—") if final_result else "—",
-            "severity":     final_result.get("severity", "—") if final_result else "—",
-            "pvalue":       final_result.get("pvalue",   "—") if final_result else "—",
-            "velocity_ms":  final_result.get("velocity_ms", "—") if final_result else "—",
+            "anomaly":      final_result.get("anomaly",  "-") if final_result else "-",
+            "priority":     final_result.get("priority", "-") if final_result else "-",
+            "severity":     final_result.get("severity", "-") if final_result else "-",
+            "pvalue":       final_result.get("pvalue",   "-") if final_result else "-",
+            "velocity_ms":  final_result.get("velocity_ms", "-") if final_result else "-",
         })
 
     # 5. Report
     m = compute_metrics(tp, fp, fn, tn)
-    print("\n" + "─" * 50)
-    print("  RESULTS  [Real Data — Mendeley Testbed, 47 m PVC]")
-    print("─" * 50)
+    print("\n" + "-" * 50)
+    print("  RESULTS  [Real Data - Mendeley Testbed, 47 m PVC]")
+    print("-" * 50)
     for k, v in m.items():
         print(f"  {k:<14}: {v}")
-    print("─" * 50)
-    print("  Localisation MAE: n/a (no ground-truth distance in Mendeley data)")
-    print("  Salinity source : Lee et al. (2023), DOI: 10.1016/j.margeo.2023.107089")
-    print("─" * 50)
+    print("-" * 50)
+    print("  Localisation MAE : n/a (no ground-truth distance in Mendeley data)")
+    print("  Salinity source  : Lee et al. (2023), DOI: 10.1016/j.margeo.2023.107089")
+    print("-" * 50)
 
     df = pd.DataFrame(records)
     df.to_csv(RESULTS_CSV, index=False)
     print(f"\n  Saved: {RESULTS_CSV}")
 
-    # Per-sensor-type breakdown
+    # Per-sensor breakdown (only shown when multiple sensor types evaluated)
     if df["sensor_type"].nunique() > 1:
         print("\n  Per-sensor breakdown:")
         for stype, grp in df.groupby("sensor_type"):
-            t = int((grp["pred_leak"] & (grp["true_label"]==1)).sum())
-            f = int((grp["pred_leak"] & (grp["true_label"]==0)).sum())
-            n = int((~grp["pred_leak"] & (grp["true_label"]==1)).sum())
-            g = int((~grp["pred_leak"] & (grp["true_label"]==0)).sum())
-            sm = compute_metrics(t, f, n, g)
-            print(f"    {stype:<14} F1={sm['F1']}  Recall={sm['Recall']}  "
+            t = int((grp["pred_leak"] & (grp["true_label"] == 1)).sum())
+            f = int((grp["pred_leak"] & (grp["true_label"] == 0)).sum())
+            fn_ = int((~grp["pred_leak"] & (grp["true_label"] == 1)).sum())
+            g = int((~grp["pred_leak"] & (grp["true_label"] == 0)).sum())
+            sm = compute_metrics(t, f, fn_, g)
+            print(f"    {stype:<22}  F1={sm['F1']}  "
+                  f"Recall={sm['Recall']}  Precision={sm['Precision']}  "
                   f"FAR={sm['FAR']}  n={len(grp)}")
 
-    print("\n  Next: BattLeDIM pressure/flow validation → Phase 3.\n")
+    # Anomaly class distribution
+    if "anomaly" in df.columns:
+        dispatched_df = df[df["dispatched"] == True]
+        if len(dispatched_df) > 0:
+            print("\n  Anomaly class distribution (dispatched only):")
+            for cls, cnt in dispatched_df["anomaly"].value_counts().items():
+                print(f"    {cls:<14}: {cnt}")
+
+    print()
 
 
 if __name__ == "__main__":
