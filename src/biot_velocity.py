@@ -1,45 +1,79 @@
 """
-Biot-Gassmann acoustic velocity for saturated sandy reclaimed soil.
-Valid range: 3-10 psu (Nakdong Estuary, EDC reclaimed aquifer).
+biot_velocity.py — Biot acoustic velocity for EDC saline pipes
+PGPL v2.0 | Reused + cleaned from PROJECT_PGPL
 """
 import numpy as np
 
+# ── Constants ──────────────────────────────────────────────────────────────────
+RHO_FRESH   = 998.0    # kg/m³ freshwater
+RHO_SALINE  = 1025.0   # kg/m³ seawater (EDC Busan)
+K_WATER     = 2.15e9   # Bulk modulus water (Pa)
+K_SALINE    = 2.34e9   # Bulk modulus saline (Pa)  ← EDC-specific
+E_STEEL     = 200e9    # Young's modulus steel (Pa)
+E_HDPE      = 0.8e9    # Young's modulus HDPE (Pa)
+NU_STEEL    = 0.30
+NU_HDPE     = 0.46
 
-def get_biot_velocity(
-    salinity_psu: float = 7.0,
-    porosity: float = 0.40,
-    temperature_c: float = 20.0,
+PIPE_MATERIALS = {
+    "steel": (E_STEEL, NU_STEEL),
+    "hdpe":  (E_HDPE,  NU_HDPE),
+    "pvc":   (3.0e9,   0.38),
+    "ci":    (170e9,   0.26),   # cast iron
+}
+
+
+def biot_wave_speed(
+    diameter_m: float,
+    thickness_m: float,
+    material: str = "hdpe",
+    saline: bool = True,
+    tidal_psi: float = 0.0,
 ) -> float:
     """
-    Returns P-wave velocity in m/s, clipped to [1450, 1520].
+    Compute acoustic wave speed via Biot thin-shell model.
 
     Parameters
     ----------
-    salinity_psu  : groundwater salinity (3-10 psu)
-    porosity      : soil porosity (0.30-0.50)
-    temperature_c : porewater temperature °C
+    diameter_m   : Inner pipe diameter (m)
+    thickness_m  : Pipe wall thickness (m)
+    material     : One of {steel, hdpe, pvc, ci}
+    saline       : True → EDC saline props; False → freshwater
+    tidal_psi    : Tidal back-pressure (PSI) — adjusts bulk modulus
+
+    Returns
+    -------
+    c : float  wave speed (m/s)
     """
-    s = float(np.clip(salinity_psu, 0.0, 35.0))
-    n = float(np.clip(porosity, 0.30, 0.50))
+    if material not in PIPE_MATERIALS:
+        raise ValueError(f"Unknown material '{material}'. Choose: {list(PIPE_MATERIALS)}")
 
-    K_frame = 8e8 * (1.0 - n / 0.40)
-    K_fluid = 2.25e9 + s * 2.4e6          # +2.4 MPa/psu (Biot-Stoll)
-    K_grain = 3.6e10                        # quartz
+    E, nu   = PIPE_MATERIALS[material]
+    rho     = RHO_SALINE if saline else RHO_FRESH
+    K_fluid = K_SALINE   if saline else K_WATER
 
-    rho_fluid = 1000.0 + 0.8 * s
-    rho_bulk  = (1.0 - n) * 2650.0 + n * rho_fluid
+    # Tidal pressure correction (EDC novelty)
+    tidal_pa = tidal_psi * 6894.76
+    K_eff    = K_fluid * (1.0 + tidal_pa / K_fluid)
 
-    A     = (1.0 - K_frame / K_grain) ** 2
-    B     = n / K_fluid + (1.0 - n) / K_grain - K_frame / K_grain ** 2
-    K_sat = K_frame + A / B
+    # Biot compliance factor
+    D     = diameter_m
+    e     = thickness_m
+    psi_b = (K_eff * D) / (E * e) * (1.0 - nu ** 2)
 
-    G = 4e8 * (1.0 - n / 0.40)
-    M = K_sat + 4.0 / 3.0 * G
-
-    v = np.sqrt(M / rho_bulk) + (temperature_c - 20.0) * 0.4
-    return float(np.clip(v, 1450.0, 1520.0))
+    c = np.sqrt(K_eff / (rho * (1.0 + psi_b)))
+    return float(c)
 
 
-if __name__ == "__main__":
-    for s in [3, 5, 7, 9, 10]:
-        print(f"  {s:2d} psu → {get_biot_velocity(s):.1f} m/s")
+def tdoa_distance(
+    c: float,
+    dt_sec: float,
+    sensor_spacing_m: float,
+) -> float:
+    """
+    Compute leak location from Time Difference of Arrival.
+
+    Returns distance from sensor A (m).
+    x = (L - c * Δt) / 2
+    """
+    x = (sensor_spacing_m - c * dt_sec) / 2.0
+    return float(np.clip(x, 0.0, sensor_spacing_m))

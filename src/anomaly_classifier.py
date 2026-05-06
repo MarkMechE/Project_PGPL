@@ -1,110 +1,82 @@
+"""
+anomaly_classifier.py — 6-class leak classifier + severity scorer
+PGPL v2.0 | Reused + cleaned from PROJECT_PGPL
+"""
 import numpy as np
-from scipy.signal import welch
+from dataclasses import dataclass, field
+from typing import Literal
 
-TYPE_WEIGHTS = {
-    "Burst":        1.0,
-    "Crack":        0.8,
-    "Micro":        0.6,
-    "PressureDrop": 0.4,
-    "Pump":         0.1,
-    "Tidal":        0.0,
+# ── Leak Types & Weights ───────────────────────────────────────────────────────
+LeakType = Literal["Burst", "Crack", "Joint", "Corrosion", "Pinhole", "Unknown"]
+
+TYPE_WEIGHTS: dict[str, float] = {
+    "Burst":     1.00,
+    "Crack":     0.85,
+    "Joint":     0.70,
+    "Corrosion": 0.60,
+    "Pinhole":   0.45,
+    "Unknown":   0.30,
 }
-LEAK_CLASSES = {"Burst", "Crack", "Micro"}
+
+SEVERITY_THRESHOLDS = {
+    "Critical": 0.80,
+    "High":     0.60,
+    "Medium":   0.40,
+    "Low":      0.00,
+}
 
 
-def extract_features(signal: np.ndarray, fs: int = 2000) -> dict:
-    freqs, psd = welch(signal, fs=fs, nperseg=min(256, len(signal)))
-    total = float(np.sum(psd)) + 1e-12
-    def band(f_lo, f_hi):
-        return float(np.sum(psd[(freqs >= f_lo) & (freqs < f_hi)])) / total
-    rms   = float(np.sqrt(np.mean(signal ** 2)))
-    peak  = float(np.max(np.abs(signal)))
-    crest = peak / (rms + 1e-9)
-    return {
-        "rms":       rms,
-        "crest":     crest,
-        "b_0_50":    band(0,   50),
-        "b_50_200":  band(50,  200),
-        "b_200_800": band(200, 800),
-        "b_0_200":   band(0,   200),
-        "centroid":  float(np.sum(freqs * psd) / (np.sum(psd) + 1e-12)),
-    }
+@dataclass
+class LeakEvent:
+    timestamp:    float
+    leak_type:    LeakType      = "Unknown"
+    severity_raw: float         = 0.0       # 0–1
+    severity_lbl: str           = "Low"
+    confidence:   float         = 0.0       # conformal prediction interval width
+    location_m:   float         = -1.0      # TDOA result; -1 = unknown
+    p1_score:     float         = 0.0       # Pressure anomaly
+    p2_score:     float         = 0.0       # Flow anomaly
+    p3_score:     float         = 0.0       # Acoustic energy
+    p4_score:     float         = 0.0       # Tidal correlation
+    meta:         dict          = field(default_factory=dict)
+
+    def fused_score(self) -> float:
+        """Weighted P1–P4 fusion (EDC patent claim)."""
+        return float(
+            0.30 * self.p1_score
+            + 0.30 * self.p2_score
+            + 0.25 * self.p3_score
+            + 0.15 * self.p4_score
+        )
 
 
-def classify(
-    signal: np.ndarray,
-    salinity_psu: float = 7.0,
-    pressure_z:   float = 0.0,
-    fs:           int   = 2000,
-) -> tuple:
+def classify_leak(
+    energy_ratio: float,
+    freq_centroid_hz: float,
+    pressure_drop_psi: float,
+) -> tuple[LeakType, float]:
     """
-    Called ONLY after the persistence gate fires — signal is confirmed anomalous.
-    Role: determine leak TYPE, not re-gate.
+    Heuristic 6-class classifier based on signal features.
 
-    Measured Mendeley feature ranges (steady-state windows):
-      NL : b_200_800=0.004-0.037, b_0_200=0.957-0.995, rms=0.002-0.015
-      CC : b_200_800=0.003-0.094, b_0_200=0.901-0.995, rms=0.001-0.013
-      OL : b_200_800 highest, b_0_200 lowest among leak types
-      LC : b_200_800=0.046, moderate
-      GL : b_200_800=0.021, subtle (gasket damps)
-
-    Strategy: gate already confirmed anomaly. Classifier ranks by spectral shape.
-    Primary discriminant: b_200_800 ratio (higher = more turbulent leak).
-    Secondary: b_0_200 (lower = more energy shifted to mid/high freq).
+    Returns (leak_type, type_weight)
     """
-    f = extract_features(signal, fs)
-    rms      = f["rms"]
-    b_mid    = f["b_200_800"]
-    b_low    = f["b_0_200"]
-    b_pmp    = f["b_50_200"]
-    centroid = f["centroid"]
-
-    # ── Orifice Leak (OL): strongest turbulence ───────────────────────────────
-    # Highest b_mid, lowest b_low among all types
-    if b_mid > 0.070:
-        cls, conf = "Burst", min(0.92, 0.65 + 0.30 * b_mid)
-
-    # ── Circumferential / Longitudinal Crack ──────────────────────────────────
-    # b_mid clearly elevated vs NL baseline (~0.037)
-    elif b_mid > 0.048:
-        cls, conf = "Crack", min(0.88, 0.52 + 0.42 * b_mid)
-
-    # ── Weaker crack signal ───────────────────────────────────────────────────
-    # b_mid > NL mean but below strong crack
-    elif b_mid > 0.030 and b_low < 0.960:
-        cls, conf = "Crack", min(0.74, 0.44 + 0.38 * b_mid)
-
-    # ── Gasket Leak: low b_mid but gate confirmed anomaly ────────────────────
-    # GL has b_mid ~0.021 (actually LOWER than NL mean 0.037)
-    # Gate fired on energy shift — classify as Micro (subtle sustained leak)
-    elif b_mid < 0.030 and centroid > 200:
-        cls, conf = "Micro", min(0.68, 0.48 + rms * 12.0)
-
-    # ── Pressure Drop ─────────────────────────────────────────────────────────
-    elif salinity_psu > 7.0 and pressure_z > 1.2:
-        cls, conf = "PressureDrop", min(0.80, 0.55 + 0.08 * pressure_z)
-
-    # ── Pump harmonic ─────────────────────────────────────────────────────────
-    elif b_pmp > 0.72:
-        cls, conf = "Pump", min(0.85, 0.55 + 0.40 * b_pmp)
-
-    # ── Anomaly confirmed by gate but type unclear → default to Micro ─────────
-    # Gate fired = something is wrong. Safer to flag than miss.
+    if pressure_drop_psi > 15.0 and energy_ratio > 0.85:
+        return "Burst",     TYPE_WEIGHTS["Burst"]
+    elif freq_centroid_hz > 4000 and energy_ratio > 0.70:
+        return "Crack",     TYPE_WEIGHTS["Crack"]
+    elif 1000 < freq_centroid_hz <= 4000 and energy_ratio > 0.55:
+        return "Joint",     TYPE_WEIGHTS["Joint"]
+    elif energy_ratio > 0.40 and pressure_drop_psi < 5.0:
+        return "Corrosion", TYPE_WEIGHTS["Corrosion"]
+    elif freq_centroid_hz < 500 and energy_ratio > 0.25:
+        return "Pinhole",   TYPE_WEIGHTS["Pinhole"]
     else:
-        cls, conf = "Micro", min(0.62, 0.45 + b_mid * 5.0)
-
-    return cls, float(np.clip(conf, 0.0, 1.0)), f
+        return "Unknown",   TYPE_WEIGHTS["Unknown"]
 
 
-def severity_score(
-    confidence: float,
-    class_name: str,
-    zone_weight: float = 0.5,
-) -> tuple:
-    tw  = TYPE_WEIGHTS.get(class_name, 0.0)
-    sev = float(np.clip(0.4 * confidence + 0.3 * tw + 0.3 * zone_weight, 0.0, 1.0))
-    if   sev >= 0.80: tier = "P1-CRITICAL"
-    elif sev >= 0.60: tier = "P2-HIGH"
-    elif sev >= 0.40: tier = "P3-MODERATE"
-    else:             tier = "P4-LOW"
-    return round(sev, 3), tier
+def score_severity(fused: float) -> str:
+    """Map fused 0–1 score → severity label."""
+    for label, threshold in SEVERITY_THRESHOLDS.items():
+        if fused >= threshold:
+            return label
+    return "Low"

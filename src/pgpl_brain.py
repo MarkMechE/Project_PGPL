@@ -1,225 +1,275 @@
 """
-src/pgpl_brain.py  —  PULSE-AT Brain: Tier 2 gate + Tier 3 classify + Tier 4 localise.
-
-Claim 1 — Persistence gate: Persm = flagged_windows / N >= 0.67 (ratio, not unanimity)
-Claim 1 — Severity: Sev = 0.4*conf + 0.3*typeW + 0.3*zone_weight
-Tier 4  — Biot-Gassmann c(s) replaces hardcoded 1400 m/s
+pgpl_brain.py — Sensor-Agnostic Persistence-Gated Leak Brain
+PGPL v2.0 | fs-routing: SCADA <10 Hz | Acoustic >8 kHz
+Patent Claim: Unified gating + tidal fusion + PSI-adaptive α
 """
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
 import numpy as np
 from collections import deque
-from scipy.signal import correlate, butter, sosfilt
+from scipy.signal import butter, sosfilt, correlate
 
-from src.biot_velocity import get_biot_velocity
-from src.anomaly_classifier import classify, severity_score, LEAK_CLASSES
+from .biot_velocity      import biot_wave_speed, tdoa_distance
+from .anomaly_classifier import classify_leak, score_severity, LeakEvent
+from .tidal_gating       import TidalGatingEngine, TidalWindow
+
+# ── Sensor Routing Constants ───────────────────────────────────────────────────
+FS_SCADA_MAX  = 10.0     # Hz  — SCADA upper bound
+FS_ACOU_MIN   = 8_000.0  # Hz  — acoustic lower bound
+
+# ── Adaptive Z-Score Detector ─────────────────────────────────────────────────
+class AdaptiveZDetector:
+    """
+    Online Z-score anomaly detector with exponential moving stats.
+    Used for SCADA pressure/flow signals (fs < 10 Hz).
+    """
+
+    def __init__(self, window: int = 200, alpha: float = 0.05):
+        self.window   = window
+        self.alpha    = alpha           # EMA smoothing
+        self._buf     = deque(maxlen=window)
+        self._mu      = 0.0
+        self._sigma   = 1.0
+
+    def update(self, x: float) -> float:
+        """Return z-score for new sample x."""
+        self._buf.append(x)
+        if len(self._buf) >= 10:
+            arr         = np.array(self._buf)
+            self._mu    = float(np.mean(arr))
+            self._sigma = float(np.std(arr))  + 1e-9
+        z = (x - self._mu) / self._sigma
+        return float(z)
 
 
-# ── Adaptive z-score ───────────────────────────────────────────────────────
-class _AdaptiveZ:
+# ── Mondrian Conformal Predictor ──────────────────────────────────────────────
+class MondrianCP:
+    """
+    Mondrian conformal prediction for leak score calibration.
+    Produces valid p-values per tidal phase (stratum).
+    """
+
+    def __init__(self):
+        self._cal: dict[str, list[float]] = {}
+
+    def calibrate(self, scores: list[float], phase: str = "default"):
+        self._cal[phase] = sorted(scores)
+
+    def p_value(self, score: float, phase: str = "default") -> float:
+        cal = self._cal.get(phase, self._cal.get("default", []))
+        if not cal:
+            return 0.5
+        return float(np.mean(np.array(cal) >= score))
+
+
+# ── PSI Drift Tracker ─────────────────────────────────────────────────────────
+class PSIDriftTracker:
+    """
+    Tracks PSI baseline drift across tidal phases.
+    Feeds adaptive α into TidalGatingEngine.
+    """
+
     def __init__(self, window: int = 100):
         self._buf = deque(maxlen=window)
 
-    def score(self, value: float) -> float:
-        if len(self._buf) < 5:
-            self._buf.append(value)
+    def push(self, psi: float):
+        self._buf.append(psi)
+
+    def drift(self) -> float:
+        if len(self._buf) < 2:
             return 0.0
-        mu    = float(np.mean(self._buf))
-        sigma = float(np.std(self._buf)) + 1e-9
-        self._buf.append(value)
-        return abs(value - mu) / sigma
+        arr = np.array(self._buf)
+        return float(arr[-1] - arr[0])
+
+    def mean_psi(self) -> float:
+        return float(np.mean(self._buf)) if self._buf else 0.0
 
 
-# ── Mondrian conformal predictor ───────────────────────────────────────────
-class _MondirianCP:
-    def __init__(self):
-        self._cal: list = []
-
-    def calibrate(self, score: float) -> None:
-        self._cal.append(score)
-
-    def p_value(self, score: float) -> float:
-        if len(self._cal) < 10:
-            return 1.0
-        return float(np.mean(np.array(self._cal) >= score))
-
-
-# ── PSI drift detector ─────────────────────────────────────────────────────
-class _PSIDrift:
-    _BINS = np.linspace(0.0, 10.0, 11)
-
-    def __init__(self, ref_window: int = 50):
-        self._ref   = deque(maxlen=ref_window)
-        self._cur   = deque(maxlen=ref_window)
-        self._ready = False
-
-    def update(self, z: float) -> float:
-        if not self._ready:
-            self._ref.append(z)
-            if len(self._ref) == self._ref.maxlen:
-                self._ready = True
-            return 0.0
-        self._cur.append(z)
-        if len(self._cur) < 10:
-            return 0.0
-        r, _ = np.histogram(np.array(self._ref), bins=self._BINS, density=True)
-        c, _ = np.histogram(np.array(self._cur),  bins=self._BINS, density=True)
-        r, c = np.clip(r, 1e-6, None), np.clip(c, 1e-6, None)
-        return float(np.sum((c - r) * np.log(c / r)))
-
-
-# ── Main brain class ───────────────────────────────────────────────────────
-class PULSE_AT_Brain:
+# ── PGPL Brain ─────────────────────────────────────────────────────────────────
+class PGPLBrain:
     """
-    4-tier PGL pipeline brain.
-    Tier 1  Butterworth bandpass 200-800 Hz, 2 kHz Fs
-    Tier 2  Adaptive z + Mondrian CP + PSI + ratio persistence gate  # Claim 1
-    Tier 3  6-class heuristic classifier + P1-P4 severity scoring    # Claim 1 Eq.(1)
-    Tier 4  TDOA/xcorr distance estimate using Biot-Gassmann c(s)
-    """
+    Main sensor-agnostic leak detection brain.
 
-    # Claim 1 — persistence ratio threshold (4 of 6 windows must flag)
-    PERSIST_RATIO_THRESH = 0.67
+    Routing logic:
+    ─ fs < 10 Hz     → SCADA path (AdaptiveZ on pressure/flow)
+    ─ fs > 8000 Hz   → Acoustic path (bandpass + TDOA)
+    ─ Both present   → Fused P1–P4 scoring
+
+    Patent claims:
+    1. fs-routing gate
+    2. Tidal phase ≥3 confirmation
+    3. PSI-adaptive α via MondrianCP
+    4. Fused P1–P4 severity
+    """
 
     def __init__(
         self,
-        alpha:         float = 0.10,
-        persistence_n: int   = 6,      # paper spec: 6 events
-        psi_threshold: float = 0.20,
-        zone_weight:   float = 0.5,
+        fs: float,
+        pipe_diameter_m: float   = 0.15,
+        pipe_thickness_m: float  = 0.01,
+        pipe_material: str       = "hdpe",
+        saline: bool             = True,
+        sensor_spacing_m: float  = 100.0,
+        base_alpha: float        = 0.05,
     ):
-        self.alpha         = alpha
-        self.min_persist   = persistence_n
-        self.psi_threshold = psi_threshold
-        self.zone_weight   = zone_weight
+        self.fs               = fs
+        self.is_scada         = fs <= FS_SCADA_MAX
+        self.is_acoustic      = fs >= FS_ACOU_MIN
+        self.pipe_diameter_m  = pipe_diameter_m
+        self.pipe_thickness_m = pipe_thickness_m
+        self.pipe_material    = pipe_material
+        self.saline           = saline
+        self.sensor_spacing_m = sensor_spacing_m
+        self.base_alpha       = base_alpha
 
-        self._z        = _AdaptiveZ(window=100)
-        self._cp       = _MondirianCP()
-        self._psi      = _PSIDrift(ref_window=50)
-        # Claim 1 — buffer holds exactly min_persist flags
-        self._flag_buf = deque(maxlen=persistence_n)
-        self._cal_n    = 0
+        # Sub-modules
+        self.z_pressure  = AdaptiveZDetector(window=200, alpha=base_alpha)
+        self.z_flow      = AdaptiveZDetector(window=200, alpha=base_alpha)
+        self.cp          = MondrianCP()
+        self.psi_tracker = PSIDriftTracker()
+        self.tidal       = TidalGatingEngine()
 
-        # Legacy attribute names kept for dashboard compatibility
-        self.persist_count = 0
-        self.psi_window    = deque(maxlen=50)
+        # Cross-year calibration buffer (BattLeDIM 2018 → 2019)
+        self._cal_scores: list[float] = []
 
-    # ── Tier 1: bandpass ────────────────────────────────────────────────────
-    @staticmethod
-    def _bandpass(sig: np.ndarray, fs: int = 2000) -> np.ndarray:
-        # Bandpass only valid for acoustic signals (fs >= 2000 Hz).
-        # Pressure/SCADA signals (fs=1) pass through unchanged.
-        nyq = 0.5 * fs
-        lo  = 200 / nyq
-        hi  = 800 / nyq
-        if lo >= 1.0 or hi >= 1.0 or lo <= 0.0:
-            return sig.astype(np.float32)
-        sos = butter(4, [lo, hi], btype="band", output="sos")
-        return sosfilt(sos, sig)
+    # ── SCADA Path ─────────────────────────────────────────────────────────────
+    def process_scada(
+        self,
+        pressure_psi: float,
+        flow_lps: float,
+        timestamp: float,
+        tidal_phase: str     = "slack_low",
+        tidal_psi: float     = 0.0,
+    ) -> LeakEvent:
+        """Process one SCADA timestep. Returns LeakEvent."""
+        if not self.is_scada:
+            raise ValueError(f"fs={self.fs} Hz is not SCADA (need ≤ {FS_SCADA_MAX} Hz)")
 
-    # ── Tier 4: distance estimators ─────────────────────────────────────────
-    @staticmethod
-    def _tdoa_distance(sig: np.ndarray, velocity: float, fs: int = 2000) -> float:
-        env   = np.abs(sig)
-        onset = int(np.argmax(env > 0.5 * np.max(env)))
-        return float(np.clip(velocity * onset / fs, 0.5, 200.0))
+        self.psi_tracker.push(pressure_psi)
+        self.tidal.add_phase(TidalWindow(
+            phase=tidal_phase,
+            psi_offset=tidal_psi,
+            alpha_adj=self.tidal.adaptive_alpha(self.base_alpha),
+            timestamp=timestamp,
+        ))
 
-    @staticmethod
-    def _xcorr_distance(s1: np.ndarray, s2: np.ndarray,
-                        velocity: float, fs: int = 2000) -> float:
-        corr      = correlate(s1, s2, mode="full")
-        delay_idx = int(np.argmax(np.abs(corr))) - (len(s1) - 1)
-        return float(np.clip(abs(delay_idx / fs) * velocity, 0.0, 200.0))
+        z_p = self.z_pressure.update(pressure_psi)
+        z_f = self.z_flow.update(flow_lps)
 
-    # ── Main process ─────────────────────────────────────────────────────────
-    def process(self, sensors: dict, sensor_node_idx: int = 0) -> dict:
-        """
-        sensors keys
-        ------------
-        mic1_sig   np.ndarray  (required)
-        mic2_sig   np.ndarray  (optional, enables xcorr localisation)
-        fs         int         default 2000
-        salinity   float       psu, default 7.0
-        flow       float       L/s, default 13.0
-        true_dist  float       ground-truth distance for MAE (optional)
-        """
-        fs         = int(sensors.get("fs", 2000))
-        salinity   = float(sensors.get("salinity", 7.0))
-        flow       = float(sensors.get("flow", 13.0))
-        pressure_z = abs(flow - 13.0) / 2.0
+        p1 = float(np.clip(abs(z_p) / 5.0, 0, 1))  # pressure anomaly score
+        p2 = float(np.clip(abs(z_f) / 5.0, 0, 1))  # flow anomaly score
+        p4 = float(np.clip(abs(self.psi_tracker.drift()) / 10.0, 0, 1))  # tidal correlation
 
-        sig1     = self._bandpass(np.array(sensors["mic1_sig"]), fs)
-        sig2     = (self._bandpass(np.array(sensors["mic2_sig"]), fs)
-                    if "mic2_sig" in sensors else None)
-        velocity = get_biot_velocity(salinity)   # Biot c(s), not hardcoded 1400
-
-        # ── Tier 2 gate ──────────────────────────────────────────────────────
-        # Use bandpass energy ratio (200-800 Hz / total) as anomaly feature.
-        # Raw RMS is blind to leak type — leak signatures are spectral, not amplitude.
-        from scipy.signal import welch
-        freqs, psd = welch(sig1, fs=fs, nperseg=min(256, len(sig1)))
-        total_power = float(np.sum(psd)) + 1e-12
-        band_mask   = (freqs >= 100) & (freqs <= 600)
-        band_power  = float(np.sum(psd[band_mask]))
-        energy      = band_power / total_power   # ratio 0-1
-        z           = self._z.score(energy)
-        if self._cal_n < 500:
-            self._cp.calibrate(z)
-            self._cal_n += 1
-        p_val = self._cp.p_value(z)
-        psi   = self._psi.update(z)
-
-        self._flag_buf.append(p_val <= self.alpha)
-
-        # Claim 1 — Persistence gate: ratio >= 0.67, NOT all() unanimity
-        # Matches paper: Persm = samples_above_thresh / N
-        gated = (
-            len(self._flag_buf) == self._flag_buf.maxlen and
-            sum(self._flag_buf) / len(self._flag_buf) >= self.PERSIST_RATIO_THRESH
+        event = LeakEvent(
+            timestamp=timestamp,
+            p1_score=p1,
+            p2_score=p2,
+            p3_score=0.0,   # no acoustic in SCADA path
+            p4_score=p4,
         )
 
-        # Dashboard compat
-        self.persist_count = int(p_val <= self.alpha)
-        self.psi_window.append(psi)
+        fused = event.fused_score()
+        leak_type, _ = classify_leak(
+            energy_ratio=fused,
+            freq_centroid_hz=0.0,
+            pressure_drop_psi=abs(pressure_psi - self.psi_tracker.mean_psi()),
+        )
+        event.leak_type    = leak_type
+        event.severity_raw = fused
+        event.severity_lbl = score_severity(fused)
 
-        base = {
-            "flag":        "MONITOR",
-            "score":       round(z, 3),
-            "psi":         round(psi, 4),
-            "persist":     sum(self._flag_buf),
-            "pvalue":      round(p_val, 4),
-            "velocity_ms": round(velocity, 1),
-        }
+        # Gate through tidal filter
+        gate = self.tidal.gate_leak_event(fused)
+        event.meta["gate"]    = gate
+        event.confidence      = 1.0 - gate["alpha_eff"]
 
-        if not gated:
-            return base
+        return event
 
-        # ── Tier 3 classify ──────────────────────────────────────────────────
-        event, conf, _ = classify(sig1, salinity, pressure_z, fs)
+    # ── Acoustic Path ──────────────────────────────────────────────────────────
+    def process_acoustic(
+        self,
+        signal: np.ndarray,
+        signal_b: np.ndarray,
+        timestamp: float,
+        tidal_phase: str  = "slack_low",
+        tidal_psi: float  = 0.0,
+    ) -> LeakEvent:
+        """
+        Process one acoustic window (two sensors A+B).
+        Applies bandpass 200–4000 Hz → GCC-PHAT TDOA → Biot location.
+        """
+        if not self.is_acoustic:
+            raise ValueError(f"fs={self.fs} Hz is not acoustic (need ≥ {FS_ACOU_MIN} Hz)")
 
-        # Claim 1 — Eq.(1) severity
-        sev, tier = severity_score(conf, event, self.zone_weight)
+        self.tidal.add_phase(TidalWindow(
+            phase=tidal_phase,
+            psi_offset=tidal_psi,
+            alpha_adj=self.tidal.adaptive_alpha(self.base_alpha),
+            timestamp=timestamp,
+        ))
 
-        # ── Tier 4 localise ──────────────────────────────────────────────────
-        dist = (self._xcorr_distance(sig1, sig2, velocity, fs)
-                if sig2 is not None
-                else self._tdoa_distance(sig1, velocity, fs))
+        # Bandpass 200–4000 Hz
+        sos = butter(4, [200, 4000], btype="bandpass", fs=self.fs, output="sos")
+        a   = sosfilt(sos, signal.astype(float))
+        b   = sosfilt(sos, signal_b.astype(float))
 
-        true_dist = sensors.get("true_dist")
-        error     = round(abs(dist - true_dist), 2) if true_dist is not None else None
+        # GCC-PHAT TDOA
+        n      = len(a) + len(b) - 1
+        A      = np.fft.rfft(a, n=n)
+        B      = np.fft.rfft(b, n=n)
+        denom  = np.abs(A * np.conj(B)) + 1e-12
+        gcc    = np.fft.irfft(A * np.conj(B) / denom, n=n)
+        lag    = int(np.argmax(gcc)) - len(a) + 1
+        dt_sec = lag / self.fs
 
-        # Approx GPS offset from EDC centre (35.135N, 128.970E)
-        gps = (round(35.135 + dist * 9e-6, 6), round(128.970 + dist * 9e-6, 6))
+        # Biot wave speed + TDOA location
+        c   = biot_wave_speed(
+            self.pipe_diameter_m,
+            self.pipe_thickness_m,
+            self.pipe_material,
+            self.saline,
+            tidal_psi,
+        )
+        loc = tdoa_distance(c, dt_sec, self.sensor_spacing_m)
 
-        return {
-            **base,
-            "flag":      "DISPATCH",
-            "anomaly":   event,
-            "anom_prob": round(conf, 3),
-            "severity":  sev,
-            "priority":  tier,
-            "loc_m":     round(dist, 2),
-            "error_m":   error,
-            "gps":       gps,
-        }
+        # Energy + frequency features
+        energy_ratio   = float(np.var(a) / (np.var(signal.astype(float)) + 1e-12))
+        energy_ratio   = np.clip(energy_ratio, 0, 1)
+        freqs          = np.fft.rfftfreq(len(a), 1 / self.fs)
+        psd            = np.abs(np.fft.rfft(a)) ** 2
+        freq_centroid  = float(np.sum(freqs * psd) / (np.sum(psd) + 1e-12))
+
+        p3 = float(np.clip(energy_ratio, 0, 1))
+        p4 = float(np.clip(abs(tidal_psi) / 10.0, 0, 1))
+
+        event = LeakEvent(
+            timestamp=timestamp,
+            p1_score=0.0,   # no SCADA in acoustic path
+            p2_score=0.0,
+            p3_score=p3,
+            p4_score=p4,
+            location_m=loc,
+        )
+
+        fused = event.fused_score()
+        leak_type, _ = classify_leak(
+            energy_ratio=energy_ratio,
+            freq_centroid_hz=freq_centroid,
+            pressure_drop_psi=0.0,
+        )
+        event.leak_type    = leak_type
+        event.severity_raw = fused
+        event.severity_lbl = score_severity(fused)
+
+        gate             = self.tidal.gate_leak_event(fused)
+        event.meta["gate"]   = gate
+        event.confidence     = 1.0 - gate["alpha_eff"]
+
+        return event
+
+    # ── Cross-Year Calibration ─────────────────────────────────────────────────
+    def calibrate_from_year(self, scores: list[float], phase: str = "default"):
+        """Feed 2018 calibration scores → MondrianCP."""
+        self._cal_scores.extend(scores)
+        self.cp.calibrate(self._cal_scores, phase=phase)

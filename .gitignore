@@ -1,15 +1,24 @@
+# Secrets
+.env
+
+# Data (iCloud only – never commit)
+data/
+outputs/
+*.raw
+*.wav
+*.csv
+*.mat
+
+# Python
 __pycache__/
 *.pyc
-*.pyo
+.venv/
+*.egg-info/
+
+# IDE
 .vscode/
-cache/
-pulse_at_exports/
-outputs/*.csv
-outputs/*.png
-data/synthetic/*.csv
-data/real/*.csv
-data/real/*.wav
-# Dataset — stored in iCloud, not committed to repo
-data/real/
-outputs/*.csv
-config_local.py
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
