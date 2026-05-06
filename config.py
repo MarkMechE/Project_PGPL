@@ -1,37 +1,65 @@
 """
-config.py  —  Project PULSE-AT path configuration.
-
-Edit DATASET_ROOT to point to your local copy of the Mendeley dataset.
-Default assumes iCloud sync on macOS.
+config.py — Project PGPL path configuration.
+Auto-detects Windows (iCloudDrive) vs Mac (Library/Mobile Documents).
 """
 import os
+import sys
+from typing import Optional
 
-# ── Dataset root ───────────────────────────────────────────────────────────
-# Change this line if your dataset is somewhere else.
-DATASET_ROOT = os.path.expanduser(
-    "~/Library/Mobile Documents/com~apple~CloudDocs/Project_PGPL_Dataset"
-)
+# ── Auto-detect iCloud path (fallback to env var) ───────────────────────────
+DATASET_ROOT = os.environ.get("PGPL_DATASET_ROOT")  # Override via env
+if not DATASET_ROOT:
+    if sys.platform == "win32":
+        DATASET_ROOT = os.path.join(os.environ["USERPROFILE"], "iCloudDrive", "Project_PGPL_Dataset")
+    else:
+        DATASET_ROOT = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Project_PGPL_Dataset")
 
-ACCEL_DIR    = os.path.join(DATASET_ROOT, "Accelerometer")
-PRESSURE_DIR = os.path.join(DATASET_ROOT, "Dynamic Pressure Sensor")
-HYDRO_DIR    = os.path.join(DATASET_ROOT, "Hydrophone")
+# ── Mendeley dirs ───────────────────────────────────────────────────────────
+MENDELEY_DIR = os.path.join(DATASET_ROOT, "Mendeley")
+ACCEL_DIR    = os.path.join(MENDELEY_DIR, "Accelerometer")
+PRESSURE_DIR = os.path.join(MENDELEY_DIR, "Dynamic Pressure Sensor")
+HYDRO_DIR    = os.path.join(MENDELEY_DIR, "Hydrophone")
 
-# ── Salinity ───────────────────────────────────────────────────────────────
-# Source: Lee et al. (2023), Marine Geology, DOI: 10.1016/j.margeo.2023.107089
-# Nakdong Estuary reclaimed aquifer (EDC pipe zone): brackish 3–10 psu
-# (KHOA 2020 tidal data cited therein; open seawater 25–35 psu is NOT used)
+# ── BattleDIM ───────────────────────────────────────────────────────────────
+BATTLEDIM_DIR = os.path.join(DATASET_ROOT, "BattleDIM")
+
+# ── BattleDIM Files (Optional: Set to None if not needed) ───────────────────
+FLOWS_2019    = os.path.join(BATTLEDIM_DIR, "2019_SCADA_Flows.csv")
+PRESSURES_2019 = os.path.join(BATTLEDIM_DIR, "2019_SCADA_Pressures.csv")
+LEAKAGES_2019 = os.path.join(BATTLEDIM_DIR, "2019_Leakages.csv")
+FLOWS_2018    = os.path.join(BATTLEDIM_DIR, "2018_SCADA_Flows.csv")
+PRESSURES_2018 = os.path.join(BATTLEDIM_DIR, "2018_SCADA_Pressures.csv")
+LTOWN_INP     = os.path.join(BATTLEDIM_DIR, "L-TOWN.inp")
+
+# ── Salinity (Lee et al. 2023, Marine Geology) ──────────────────────────────
 SALINITY_MEAN_PSU  = 7.0
 SALINITY_RANGE_PSU = (3.0, 10.0)
 
-# ── Pipeline constants ─────────────────────────────────────────────────────
-FS               = 2000    # Hz — resample target for classifier
-ALPHA            = 0.05    # Mondrian CP significance level
-PERSISTENCE_N    = 6       # windows per evaluation block
-PERSIST_RATIO    = 0.67    # Claim 1: ≥ 4/6 windows must flag
-PSI_THRESHOLD    = 0.20
-ZONE_WEIGHT      = 0.5     # default; override per pipe segment if known
+# ── Pipeline constants ──────────────────────────────────────────────────────
+FS            = 2000
+ALPHA         = 0.05
+PERSISTENCE_N = 6
+PERSIST_RATIO = 0.67
+PSI_THRESHOLD = 0.20
+ZONE_WEIGHT   = 0.5
 
-# ── Output paths ───────────────────────────────────────────────────────────
-OUTPUTS_DIR      = "outputs"
-RESULTS_CSV      = os.path.join(OUTPUTS_DIR, "real_data_results.csv")
-BATTLEDIM_DIR = os.path.join(DATASET_ROOT, "BattLeDIM")
+# ── Output paths ────────────────────────────────────────────────────────────
+OUTPUTS_DIR = "outputs"
+RESULTS_CSV = os.path.join(OUTPUTS_DIR, "real_data_results.csv")
+
+
+def validate_paths(verbose: bool = False) -> bool:
+    """Check key paths exist. Returns True if OK."""
+    paths = [DATASET_ROOT, MENDELEY_DIR, BATTLEDIM_DIR]
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        if verbose:
+            print(f"❌ Missing: {missing}")
+        return False
+    if verbose:
+        print("✅ All key paths exist.")
+    return True
+
+
+# Auto-validate on import (quiet by default)
+validate_paths(verbose=False)

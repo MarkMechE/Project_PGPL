@@ -266,7 +266,7 @@ def get_pipe_distances(inp_filepath: str,
         return {}
 
 # ── Background (always-on) leak pipes ─────────────────────────────────────────
-BACKGROUND_PIPES = {"p31", "p102", "p186", "p229", "p280"}  # BattLeDIM 2019 known background
+BACKGROUND_PIPES = {"p257", "p654", "p427", "p810", "p280", "p710"}  # BattLeDIM 2019 known background
 
 
 # ── Pressure deviation helper ─────────────────────────────────────────────────
