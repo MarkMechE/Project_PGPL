@@ -54,30 +54,49 @@ class TidalWindow:
 
 @dataclass
 class LeakEvent:
-    """
-    Output of every Brain.process_*() call.
-    All scores are unit-free [0, 1].
-    """
     timestamp:    float          = 0.0
     leak_type:    str            = "Normal"
     severity_raw: float          = 0.0
     severity_lbl: str            = "Low"
     confidence:   float          = 0.0
     location_m:   float          = -1.0
-    p1_score:     float          = 0.0   # Pressure anomaly
-    p2_score:     float          = 0.0   # Flow anomaly
-    p3_score:     float          = 0.0   # Acoustic energy
-    p4_score:     float          = 0.0   # PSI drift / tidal
+    p1_score:     float          = 0.0
+    p2_score:     float          = 0.0
+    p3_score:     float          = 0.0
+    p4_score:     float          = 0.0
     meta:         Dict[str, Any] = field(default_factory=dict)
 
+    # Fixed weights — same for all sensors
+    _W = (0.40, 0.30, 0.20, 0.10)
+
     def fused_score(self) -> float:
-        """Weighted P1–P4 fusion (patent claim 4)."""
-        return (
-            0.40 * self.p1_score
-            + 0.30 * self.p2_score
-            + 0.20 * self.p3_score
-            + 0.10 * self.p4_score
-        )
+        """
+        Sensor-agnostic weighted fusion.
+
+        Normalises by the sum of weights of ACTIVE channels only.
+        Active = score > 0.0
+
+        This means:
+          SCADA only   (p1+p2 active)      → normalised over 0.70
+          Acoustic only (p3+p4 active)     → normalised over 0.30
+          All active   (p1+p2+p3+p4)       → normalised over 1.00
+
+        Same threshold works for ALL sensor combinations.
+        No sensor-specific tuning needed.
+        Patent claim: unified gate regardless of sensor type.
+        """
+        scores  = (self.p1_score, self.p2_score,
+                   self.p3_score, self.p4_score)
+        weights = self._W
+
+        weighted_sum   = sum(w * s for w, s in zip(weights, scores))
+        active_weights = sum(w for w, s in zip(weights, scores) if s > 0.0)
+
+        if active_weights < 1e-9:
+            return 0.0
+
+        # Normalise to [0, 1] regardless of which sensors are active
+        return float(weighted_sum / active_weights)
 
     @property
     def is_confirmed(self) -> bool:
@@ -361,7 +380,7 @@ class PGPLBrain:
         self.fs           = fs
         self.is_scada     = (fs <= FS_SCADA_MAX)
         self.is_acoustic  = (fs >= FS_ACOU_MIN - 1.0)   # 7999+ = acoustic
-        
+
         if not self.is_scada and not self.is_acoustic:
             raise ValueError(
                 f"fs={fs:.1f} Hz is not SCADA (≤{FS_SCADA_MAX}Hz) "
