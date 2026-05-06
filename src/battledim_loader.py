@@ -108,19 +108,28 @@ def load_battledim_2018() -> dict[str, pd.DataFrame]:
 
 def build_ground_truth(leakages: pd.DataFrame) -> pd.Series:
     """
-    BattLeDIM GT: ANY pipe node leaking > 0.5 lps → label=1.
-    Leakages CSV = time-series magnitudes, NOT event table.
-    Threshold 0.5 → ~10-15% positive rate (realistic).
+    BattleDIM GT: time-series of per-pipe leak magnitudes.
+    Label = 1 if ANY pipe node actively leaking > 0.5 lps.
+
+    Why 0.5 threshold:
+      - BattleDIM zero-leak rows = exactly 0.0
+      - Smallest real leak ≈ 1.5 lps
+      - 0.5 gives clean binary separation
+    Expected positive rate: ~10–15%
     """
     print(f"  🏗️  Raw leaks shape: {leakages.shape}")
-    leakages.index = pd.to_datetime(leakages.index, errors='coerce')
-    leakages = leakages.apply(pd.to_numeric, errors='coerce').fillna(0.0)
 
-    # Binary: ANY node > threshold → leak active
-    LEAK_THRESHOLD = 0.5   # lps — tune if rate too high/low
-    gt = (leakages > LEAK_THRESHOLD).any(axis=1).astype(int)
+    leakages.index = pd.to_datetime(leakages.index, errors="coerce")
+    leakages       = leakages.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    LEAK_THRESHOLD = 0.5   # lps
+
+    gt            = (leakages > LEAK_THRESHOLD).any(axis=1).astype(int)
     gt.index.name = "Timestamp"
-    gt.name = "leak_active"
+    gt.name       = "leak_active"
 
-    print(f"  ✅  GT: {gt.sum():,} leak steps / {len(gt):,} total ({gt.mean():.1%} positive rate)")
+    print(
+        f"  ✅  GT: {gt.sum():,} leak steps / "
+        f"{len(gt):,} total  ({gt.mean():.1%} positive rate)"
+    )
     return gt

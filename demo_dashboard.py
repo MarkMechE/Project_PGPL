@@ -9,7 +9,7 @@ import sys, os
 
 sys.path.insert(0, os.path.dirname(__file__))
 from src.pgpl_brain   import PGPLBrain
-from src.tidal_gating import TidalWindow
+
 
 st.set_page_config(page_title="PGPL v2.0 Demo", page_icon="💧", layout="wide")
 st.title("💧 PGPL v2.0 — Sensor-Agnostic Leak Detection")
