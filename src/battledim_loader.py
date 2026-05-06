@@ -111,11 +111,10 @@ def build_ground_truth(leakages: pd.DataFrame) -> pd.Series:
     BattleDIM GT: time-series of per-pipe leak magnitudes.
     Label = 1 if ANY pipe node actively leaking > 0.5 lps.
 
-    Why 0.5 threshold:
-      - BattleDIM zero-leak rows = exactly 0.0
-      - Smallest real leak ≈ 1.5 lps
-      - 0.5 gives clean binary separation
-    Expected positive rate: ~10–15%
+    Why threshold = 0.5:
+      - Zero-leak rows in BattleDIM = exactly 0.0
+      - Smallest real leak in dataset ≈ 1.5 lps
+      - 0.5 gives clean binary separation → ~10-15% positive rate
     """
     print(f"  🏗️  Raw leaks shape: {leakages.shape}")
 
