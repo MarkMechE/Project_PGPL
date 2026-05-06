@@ -360,8 +360,8 @@ class PGPLBrain:
     ):
         self.fs           = fs
         self.is_scada     = (fs <= FS_SCADA_MAX)
-        self.is_acoustic  = (fs >= FS_ACOU_MIN)
-
+        self.is_acoustic  = (fs >= FS_ACOU_MIN - 1.0)   # 7999+ = acoustic
+        
         if not self.is_scada and not self.is_acoustic:
             raise ValueError(
                 f"fs={fs:.1f} Hz is not SCADA (≤{FS_SCADA_MAX}Hz) "

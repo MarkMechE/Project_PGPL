@@ -129,54 +129,60 @@ def run_battledim_f1() -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 def run_mendeley_f1() -> dict:
     print("\n" + "═" * 52)
-    print("  Mendeley F1 Evaluation  (Acoustic)")
+    print("  Mendeley F1 Evaluation  (Acoustic — RAW PCM_32)")
     print("═" * 52)
 
-    hydro_files = load_hydrophone_files()
-    if len(hydro_files) < 2:
-        print("  [SKIP] Need ≥2 .wav files in Mendeley/Hydrophone/")
-        print("  ℹ️  Download: DOI 10.17632/tbrnp6vrnj.1")
+    from src.mendeley_loader import load_hydrophone_pairs, read_raw_pair
+    from src.pgpl_brain     import TidalWindow
+
+    pairs = load_hydrophone_pairs()
+
+    if len(pairs) < 2:
+        print("  [SKIP] No .raw pairs found.")
         return {"dataset": "Mendeley", "F1": None,
                 "Precision": None, "Recall": None, "FAR": None}
 
-    pairs = [
-        (hydro_files[i], hydro_files[i + 1])
-        for i in range(0, len(hydro_files) - 1, 2)
-    ]
-    print(f"  {len(pairs)} sensor pairs found")
+    y_pred_list = []
+    y_true_list = []
+    tdoa_errors = []
 
-    y_pred_list, tdoa_errors = [], []
-
-    from src.pgpl_brain import TidalWindow   # reuse from brain
-
-    for j, (path_a, path_b) in enumerate(
-        tqdm(pairs, desc="  🎙  Mendeley")
-    ):
+    for j, pair_info in enumerate(tqdm(pairs, desc="  🎙  Mendeley")):
         try:
-            sig_a, sig_b, fs = read_wav_pair(path_a, path_b)
+            sig_a, sig_b, fs = read_raw_pair(
+                pair_info["path_a"],
+                pair_info["path_b"],
+            )
         except Exception as e:
-            print(f"  [WARN] Pair {j}: {e}")
+            print(f"  [WARN] {pair_info['stem']}: {e}")
             continue
 
+        # fs=8000 → exactly at FS_ACOU_MIN boundary → acoustic path ✓
         brain = PGPLBrain(
-            fs=fs, pipe_diameter_m=0.10,
-            pipe_thickness_m=0.008, pipe_material="hdpe",
-            saline=True, sensor_spacing_m=5.0,
+            fs               = fs,          # 8000 Hz
+            pipe_diameter_m  = 0.05,        # lab pipe ~50mm
+            pipe_thickness_m = 0.005,
+            pipe_material    = "hdpe",
+            saline           = False,       # lab = freshwater
+            sensor_spacing_m = 1.5,         # lab sensor spacing
         )
 
-        # Pre-seed ≥3 tidal phases so gate is ready
+        # Lab setting: no real tidal — use neutral phases
         for ph in ["ebb", "flood", "slack_low", "slack_high", "spring"]:
             brain.tidal.add_phase(TidalWindow(
-                phase=ph, psi_offset=1.0,
+                phase=ph, psi_offset=0.0,
                 alpha_adj=brain.tidal.adaptive_alpha(),
                 timestamp=float(j),
             ))
 
         phase, tidal_psi = mock_tidal_phase(j)
-        event = brain.process_acoustic(sig_a, sig_b, float(j), phase, tidal_psi)
+        event = brain.process_acoustic(
+            sig_a, sig_b, float(j), phase, tidal_psi,
+        )
 
         gate = event.meta.get("gate", {})
         y_pred_list.append(1 if gate.get("confirmed", False) else 0)
+        y_true_list.append(pair_info["label"])   # ← from folder name
+
         if event.location_m >= 0:
             tdoa_errors.append(event.location_m)
 
@@ -185,18 +191,30 @@ def run_mendeley_f1() -> dict:
                 "Precision": None, "Recall": None, "FAR": None}
 
     y_pred = np.array(y_pred_list, dtype=int)
-    y_true = np.ones_like(y_pred)           # All paired WAVs = leak signals
+    y_true = np.array(y_true_list, dtype=int)
+
+    print(f"  📊 y_true: {y_true.sum()} leak / {(1-y_true).sum()} no-leak "
+          f"({y_true.mean():.1%})")
+    print(f"  📊 y_pred: {y_pred.sum()} detected / {len(y_pred)} total")
 
     f1  = f1_score(y_true, y_pred, zero_division=0)
-    far = float(np.sum((y_pred == 1) & (y_true == 0)) / max(np.sum(y_true == 0), 1))
+    pre = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    far = float(
+        np.sum((y_pred == 1) & (y_true == 0)) / max(np.sum(y_true == 0), 1)
+    )
     mae = float(np.mean(tdoa_errors)) if tdoa_errors else float("nan")
 
-    print(f"  F1={f1:.3f}  TDOA_MAE={mae:.2f}m  FAR={far:.4f}")
+    print(f"  F1={f1:.3f}  Precision={pre:.3f}  "
+          f"Recall={rec:.3f}  FAR={far:.4f}  TDOA_MAE={mae:.2f}m")
+
     return {
         "dataset":    "Mendeley",
-        "F1":         round(f1, 3),
-        "TDOA_MAE_m": round(mae, 2) if not np.isnan(mae) else None,
+        "F1":         round(f1,  3),
+        "Precision":  round(pre, 3),
+        "Recall":     round(rec, 3),
         "FAR":        round(far, 4),
+        "TDOA_MAE_m": round(mae, 2) if not np.isnan(mae) else None,
     }
 
 
