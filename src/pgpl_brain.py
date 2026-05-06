@@ -502,7 +502,9 @@ class PGPLBrain:
     ) -> LeakEvent:
         """
         Process one acoustic window.
-        Bandpass → GCC-PHAT → Biot TDOA → P3/P4.
+        Sensor-agnostic: no bandpass assumption.
+        P3 = log-scale peak-to-median activity ratio.
+        Works for any fs, any sensor type.
         """
         self.tidal.add_phase(TidalWindow(
             phase      = tidal_phase,
@@ -511,58 +513,64 @@ class PGPLBrain:
             timestamp  = timestamp,
         ))
 
-        try:
-            from scipy.signal import butter, sosfilt
-            sos = butter(4, [200.0, 4000.0], btype="bandpass",
-                         fs=self.fs, output="sos")
-            a = sosfilt(sos, signal.astype(float))
-            b = sosfilt(sos, signal_b.astype(float))
-        except Exception:
-            a = np.diff(signal.astype(float),  prepend=0)
-            b = np.diff(signal_b.astype(float), prepend=0)
+        sig_a = signal.astype(float)
+        sig_b = signal_b.astype(float)
 
-        # GCC-PHAT
-        n     = len(a) + len(b) - 1
-        A_fft = np.fft.rfft(a, n=n)
-        B_fft = np.fft.rfft(b, n=n)
-        gcc   = np.fft.irfft(
-            A_fft * np.conj(B_fft) / (np.abs(A_fft * np.conj(B_fft)) + 1e-12),
-            n=n,
-        )
-        lag = int(np.argmax(gcc)) - len(a) + 1
-        dt  = lag / self.fs
+        # ── GCC-PHAT TDOA ──────────────────────────────────────────────────────
+        n_fft  = len(sig_a) + len(sig_b) - 1
+        A_fft  = np.fft.rfft(sig_a, n=n_fft)
+        B_fft  = np.fft.rfft(sig_b, n=n_fft)
+        cross  = A_fft * np.conj(B_fft)
+        gcc    = np.fft.irfft(cross / (np.abs(cross) + 1e-12), n=n_fft)
+        lag    = int(np.argmax(gcc)) - len(sig_a) + 1
+        dt     = lag / self.fs
 
         c   = _biot_wave_speed(self.pipe_diameter_m, self.pipe_thickness_m,
                                 self.pipe_material, self.saline, tidal_psi)
         loc = _tdoa_locate(c, dt, self.sensor_spacing_m)
 
-        # Energy ratio (unit-free)
-        raw_var      = float(np.var(signal.astype(float))) + 1e-12
-        energy_ratio = float(np.clip(np.var(a) / raw_var, 0.0, 1.0))
+        # ── P3: sensor-agnostic activity score ─────────────────────────────────
+        # Peak-to-median power ratio on RAW signal (no bandpass assumption)
+        # Captures impulsive/transient events regardless of frequency content
+        combined      = (sig_a ** 2 + sig_b ** 2) / 2.0
+        median_power  = float(np.median(combined)) + 1e-12
+        peak_power    = float(np.percentile(combined, 99))  # robust peak
+        activity      = peak_power / median_power
 
-        freqs         = np.fft.rfftfreq(len(a), 1.0 / self.fs)
-        psd           = np.abs(np.fft.rfft(a)) ** 2
-        freq_centroid = float(np.sum(freqs * psd) / (np.sum(psd) + 1e-12))
+        # Log-compress to [0,1]
+        p3 = float(np.clip(
+            np.log1p(activity) / np.log1p(500.0),
+            0.0, 1.0
+        ))
 
-        p3 = energy_ratio
+        # ── P4: tidal drift ────────────────────────────────────────────────────
         p4 = float(np.clip(abs(tidal_psi) / 10.0, 0.0, 1.0))
 
+        # ── Frequency centroid (classification only) ───────────────────────────
+        psd           = np.abs(np.fft.rfft(sig_a)) ** 2
+        freqs         = np.fft.rfftfreq(len(sig_a), 1.0 / self.fs)
+        freq_centroid = float(np.sum(freqs * psd) / (np.sum(psd) + 1e-12))
+
+        # ── Build event ────────────────────────────────────────────────────────
         event = LeakEvent(
             timestamp  = timestamp,
-            p1_score   = 0.0, p2_score = 0.0,
-            p3_score   = p3,  p4_score = p4,
+            p1_score   = 0.0,
+            p2_score   = 0.0,
+            p3_score   = p3,
+            p4_score   = p4,
             location_m = loc,
         )
-        fused = event.fused_score()
+
+        fused       = event.fused_score()
         ltype, slbl = _classify(fused, 0.0, freq_centroid)
 
         event.leak_type    = ltype
         event.severity_raw = fused
         event.severity_lbl = slbl
-        event.meta["gate"]            = self.tidal.gate_leak_event(fused)
-        event.meta["biot_c_ms"]       = round(c, 2)
+        event.meta["gate"]             = self.tidal.gate_leak_event(fused)
+        event.meta["biot_c_ms"]        = round(c, 2)
         event.meta["freq_centroid_hz"] = round(freq_centroid, 1)
-        event.confidence              = 1.0 - self.tidal.adaptive_alpha(self.base_alpha)
+        event.confidence               = 1.0 - self.tidal.adaptive_alpha(self.base_alpha)
 
         return event
 
