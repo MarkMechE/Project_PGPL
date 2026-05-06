@@ -529,19 +529,19 @@ class PGPLBrain:
                                 self.pipe_material, self.saline, tidal_psi)
         loc = _tdoa_locate(c, dt, self.sensor_spacing_m)
 
-        # ── P3: sensor-agnostic activity score ─────────────────────────────────
-        # Peak-to-median power ratio on RAW signal (no bandpass assumption)
-        # Captures impulsive/transient events regardless of frequency content
-        combined      = (sig_a ** 2 + sig_b ** 2) / 2.0
-        median_power  = float(np.median(combined)) + 1e-12
-        peak_power    = float(np.percentile(combined, 99))  # robust peak
-        activity      = peak_power / median_power
-
-        # Log-compress to [0,1]
-        p3 = float(np.clip(
-            np.log1p(activity) / np.log1p(500.0),
-            0.0, 1.0
-        ))
+        # ── P3: sensor-agnostic leak indicator ────────────────────────────────
+        # Physics: leak creates asymmetric wave arrival (non-zero TDOA)
+        # No-leak transient: symmetric arrival (TDOA ≈ 0)
+        # Metric: how far is the GCC peak from zero-lag?
+        # Unit-free: lag normalised by max possible lag (signal length / 2)
+        
+        max_lag     = len(sig_a) / 2.0
+        lag_ratio   = float(np.clip(abs(lag) / max_lag, 0.0, 1.0))
+        
+        # Also require some signal energy (reject pure silence)
+        has_signal  = float(np.var(sig_a) > 1e-10)
+        
+        p3 = lag_ratio * has_signal
 
         # ── P4: tidal drift ────────────────────────────────────────────────────
         p4 = float(np.clip(abs(tidal_psi) / 10.0, 0.0, 1.0))
