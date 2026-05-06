@@ -1,5 +1,5 @@
 """
-run_pipeline.py — Main F1 runner (UPDATED v2.1)
+run_pipeline.py — Main F1 Runner (v2.1 — Tuned)
 PGPL v2.0 | BattleDIM F1 target: 0.96 | Mendeley F1 target: 0.85
 Run: python run_pipeline.py
 """
@@ -8,16 +8,23 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score, precision_score, recall_score
-from tqdm import tqdm  # Progress bar
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    def tqdm(x, **kw):
+        return x
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import validate_paths, OUTPUTS_DIR
-from src.pgpl_brain        import PGPLBrain
-from src.battledim_loader  import load_battledim_2019, load_battledim_2018, build_ground_truth
-from src.mendeley_loader   import load_hydrophone_files, read_wav_pair
+from config                 import validate_paths, OUTPUTS_DIR
+from src.pgpl_brain         import PGPLBrain
+from src.battledim_loader   import load_battledim_2019, load_battledim_2018, build_ground_truth
+from src.mendeley_loader    import load_hydrophone_files, read_wav_pair
 
-# ── Tidal phase stub ──────────────────────────────────────────────────────────
+# ── Tidal Phase Stub ──────────────────────────────────────────────────────────
 TIDAL_PHASES_CYCLE = ["ebb", "flood", "slack_low", "slack_high", "spring"]
 
 def mock_tidal_phase(i: int) -> tuple[str, float]:
@@ -27,137 +34,170 @@ def mock_tidal_phase(i: int) -> tuple[str, float]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. BattLeDIM F1 (IMPROVED)
+# 1. BattLeDIM F1
 # ══════════════════════════════════════════════════════════════════════════════
 def run_battledim_f1() -> dict:
-    print("\n" + "═" * 50)
-    print("  BattLeDIM F1 Evaluation (2019 Test Year)")
-    print("═" * 50)
+    print("\n" + "═" * 52)
+    print("  BattLeDIM F1 Evaluation  (2019 Test Year)")
+    print("═" * 52)
 
-    # Load
+    # ── Load data ─────────────────────────────────────────────────────────────
     data_2018 = load_battledim_2018()
     data_2019 = load_battledim_2019()
     gt        = build_ground_truth(data_2019["leakages"])
-    print(f"  📊 GT leak rate: {gt.mean():.1%} ({gt.sum():,} positives)")
 
     pressures = data_2019["pressures"]
     flows     = data_2019["flows"]
 
-    # Init brain
-    brain = PGPLBrain(fs=1/60, saline=False)
+    # ── Init Brain ────────────────────────────────────────────────────────────
+    brain = PGPLBrain(fs=1/60, saline=False)   # BattleDIM = freshwater
 
-    # FULL calibration (105k samples!)
-    p_col = pressures.columns[0]
-    cal_pressures = data_2018["pressures"][p_col].dropna().tolist()  # FIXED: No [:500]
-    cal_z_scores  = [abs(v - np.mean(cal_pressures)) / (np.std(cal_pressures) + 1e-9)
-                     for v in cal_pressures]
+    # ── Full 2018 calibration (all 105k samples → robust baseline) ───────────
+    p_col         = data_2018["pressures"].columns[0]
+    cal_vals      = data_2018["pressures"][p_col].dropna().values
+    cal_mean      = float(np.mean(cal_vals))
+    cal_std       = float(np.std(cal_vals)) + 1e-9
+    cal_z_scores  = [abs(v - cal_mean) / cal_std for v in cal_vals]
     brain.calibrate_from_year(cal_z_scores, phase="default")
 
-    # Robust common index (drop NaNs)
-    common_idx = pressures.index.intersection(flows.index).intersection(gt.index).dropna()
+    # ── Common index (drop NaT) ───────────────────────────────────────────────
+    p_col = pressures.columns[0]
+    f_col = flows.columns[0]
+
+    common_idx = (
+        pressures.index
+        .intersection(flows.index)
+        .intersection(gt.index)
+    )
+    common_idx = common_idx[~common_idx.isna()]
     print(f"  Processing {len(common_idx):,} timesteps …")
 
-    y_pred = []
-    y_true = []
-    p_col  = pressures.columns[0]
-    f_col  = flows.columns[0]
+    y_pred, y_true = [], []
 
-    for i, ts in enumerate(tqdm(common_idx, desc="  🧠 Processing")):
-        psi  = float(pressures.loc[ts, p_col])
-        flow = float(flows.loc[ts, f_col])
+    for i, ts in enumerate(tqdm(common_idx, desc="  🧠 BattleDIM")):
+        try:
+            psi  = float(pressures.at[ts, p_col])
+            flow = float(flows.at[ts, f_col])
+        except Exception:
+            continue
+
+        if np.isnan(psi) or np.isnan(flow):
+            continue
+
         phase, tidal_psi = mock_tidal_phase(i)
 
         event = brain.process_scada(
-            pressure_psi=psi,
-            flow_lps=flow,
-            timestamp=float(ts.timestamp() / 1e9),  # Seconds
-            tidal_phase=phase,
-            tidal_psi=tidal_psi,
+            pressure_psi = psi,
+            flow_lps     = flow,
+            timestamp    = float(i),
+            tidal_phase  = phase,
+            tidal_psi    = tidal_psi,
         )
 
         gate = event.meta.get("gate", {})
-        pred = 1 if gate.get("confirmed", False) else 0
-        y_pred.append(pred)
-        y_true.append(int(gt.loc[ts]))
+        y_pred.append(1 if gate.get("confirmed", False) else 0)
+        y_true.append(int(gt.at[ts]))
 
-    y_pred = np.array(y_pred)
-    y_true = np.array(y_true)
+    y_pred = np.array(y_pred, dtype=int)
+    y_true = np.array(y_true, dtype=int)
 
-    print(f"  📈 Balance: Pos {np.sum(y_true)}/{len(y_true)} ({y_true.mean():.1%}) | Detections: {np.sum(y_pred)}")
+    # ── Debug balance ─────────────────────────────────────────────────────────
+    print(f"  📊 y_true pos: {y_true.sum():,}/{len(y_true):,}  ({y_true.mean():.1%})")
+    print(f"  📊 y_pred pos: {y_pred.sum():,}/{len(y_pred):,}  ({y_pred.mean():.1%})")
+
+    if y_pred.sum() == 0:
+        print("  ⚠️  WARNING: Brain detected 0 leaks. "
+              "Lower gate threshold in pgpl_brain.py TidalGatingEngine.")
 
     f1  = f1_score(y_true, y_pred, zero_division=0)
     pre = precision_score(y_true, y_pred, zero_division=0)
     rec = recall_score(y_true, y_pred, zero_division=0)
     far = float(np.sum((y_pred == 1) & (y_true == 0)) / max(np.sum(y_true == 0), 1))
 
-    result = {"dataset": "BattLeDIM", "F1": round(f1, 3),
-              "Precision": round(pre, 3), "Recall": round(rec, 3),
-              "FAR": round(far, 4)}
     print(f"  F1={f1:.3f}  Precision={pre:.3f}  Recall={rec:.3f}  FAR={far:.4f}")
-    return result
+    return {
+        "dataset":   "BattleDIM",
+        "F1":        round(f1,  3),
+        "Precision": round(pre, 3),
+        "Recall":    round(rec, 3),
+        "FAR":       round(far, 4),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. Mendeley F1 (FIXED imports)
+# 2. Mendeley F1 (Acoustic)
 # ══════════════════════════════════════════════════════════════════════════════
 def run_mendeley_f1() -> dict:
-    print("\n" + "═" * 50)
-    print("  Mendeley F1 Evaluation (Acoustic)")
-    print("═" * 50)
+    print("\n" + "═" * 52)
+    print("  Mendeley F1 Evaluation  (Acoustic)")
+    print("═" * 52)
 
     hydro_files = load_hydrophone_files()
     if len(hydro_files) < 2:
         print("  [SKIP] Need ≥2 .wav files in Mendeley/Hydrophone/")
-        return {"dataset": "Mendeley", "F1": None, "Precision": None, "Recall": None, "FAR": None}
+        print("  ℹ️  Download: DOI 10.17632/tbrnp6vrnj.1")
+        return {"dataset": "Mendeley", "F1": None,
+                "Precision": None, "Recall": None, "FAR": None}
 
-    pairs = [(hydro_files[i], hydro_files[i+1]) for i in range(0, len(hydro_files)-1, 2)]
-    y_pred_list = []
-    tdoa_errors = []
+    pairs = [
+        (hydro_files[i], hydro_files[i + 1])
+        for i in range(0, len(hydro_files) - 1, 2)
+    ]
+    print(f"  {len(pairs)} sensor pairs found")
 
-    print(f"  Processing {len(pairs)} pairs …")
-    for j, (path_a, path_b) in enumerate(pairs):
+    y_pred_list, tdoa_errors = [], []
+
+    from src.pgpl_brain import TidalWindow   # reuse from brain
+
+    for j, (path_a, path_b) in enumerate(
+        tqdm(pairs, desc="  🎙  Mendeley")
+    ):
         try:
             sig_a, sig_b, fs = read_wav_pair(path_a, path_b)
         except Exception as e:
             print(f"  [WARN] Pair {j}: {e}")
             continue
 
-        brain = PGPLBrain(fs=fs, pipe_diameter_m=0.10, pipe_thickness_m=0.008,
-                         pipe_material="hdpe", saline=True, sensor_spacing_m=5.0)
+        brain = PGPLBrain(
+            fs=fs, pipe_diameter_m=0.10,
+            pipe_thickness_m=0.008, pipe_material="hdpe",
+            saline=True, sensor_spacing_m=5.0,
+        )
+
+        # Pre-seed ≥3 tidal phases so gate is ready
+        for ph in ["ebb", "flood", "slack_low", "slack_high", "spring"]:
+            brain.tidal.add_phase(TidalWindow(
+                phase=ph, psi_offset=1.0,
+                alpha_adj=brain.tidal.adaptive_alpha(),
+                timestamp=float(j),
+            ))
 
         phase, tidal_psi = mock_tidal_phase(j)
-
-        # Internal TidalWindow (no import)
-        from src.pgpl_brain import TidalWindow  # From brain
-        for ph in ["ebb", "flood", "slack_low", "slack_high", "spring"]:
-            brain.tidal.add_phase(TidalWindow(phase=ph, psi_offset=tidal_psi,
-                                             alpha_adj=brain.tidal.adaptive_alpha(0.05),
-                                             timestamp=float(j)))
-
         event = brain.process_acoustic(sig_a, sig_b, float(j), phase, tidal_psi)
-        gate = event.meta.get("gate", {})
-        pred = 1 if gate.get("confirmed", False) else 0
-        y_pred_list.append(pred)
 
+        gate = event.meta.get("gate", {})
+        y_pred_list.append(1 if gate.get("confirmed", False) else 0)
         if event.location_m >= 0:
             tdoa_errors.append(event.location_m)
 
-    y_true_list = [1] * len(y_pred_list)  # All leaks assumption
-
     if not y_pred_list:
-        return {"dataset": "Mendeley", "F1": None, "Precision": None, "Recall": None, "FAR": None}
+        return {"dataset": "Mendeley", "F1": None,
+                "Precision": None, "Recall": None, "FAR": None}
 
-    y_pred = np.array(y_pred_list)
-    y_true = np.array(y_true_list)
+    y_pred = np.array(y_pred_list, dtype=int)
+    y_true = np.ones_like(y_pred)           # All paired WAVs = leak signals
 
     f1  = f1_score(y_true, y_pred, zero_division=0)
     far = float(np.sum((y_pred == 1) & (y_true == 0)) / max(np.sum(y_true == 0), 1))
     mae = float(np.mean(tdoa_errors)) if tdoa_errors else float("nan")
 
-    result = {"dataset": "Mendeley", "F1": round(f1, 3), "Precision": None, "Recall": None,
-              "TDOA_MAE_m": round(mae, 2), "FAR": round(far, 4)}
     print(f"  F1={f1:.3f}  TDOA_MAE={mae:.2f}m  FAR={far:.4f}")
-    return result
+    return {
+        "dataset":    "Mendeley",
+        "F1":         round(f1, 3),
+        "TDOA_MAE_m": round(mae, 2) if not np.isnan(mae) else None,
+        "FAR":        round(far, 4),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -167,16 +207,15 @@ if __name__ == "__main__":
     print("── PGPL v2.0 Pipeline ──")
     validate_paths(strict=True)
 
-    results = []
-    results.append(run_battledim_f1())
-    results.append(run_mendeley_f1())
+    results = [run_battledim_f1(), run_mendeley_f1()]
 
-    print("\n" + "═" * 50)
-    print("  📊 FINAL F1 TABLE")
-    print("═" * 50)
+    print("\n" + "═" * 52)
+    print("  📊  FINAL F1 TABLE")
+    print("═" * 52)
     df = pd.DataFrame(results)
     print(df.to_string(index=False))
 
-    out_path = os.path.join(OUTPUTS_DIR, "f1_results.csv")
-    df.to_csv(out_path, index=False)
-    print(f"\n  Saved → {out_path}")
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    out = os.path.join(OUTPUTS_DIR, "f1_results.csv")
+    df.to_csv(out, index=False)
+    print(f"\n  ✅  Saved → {out}")
