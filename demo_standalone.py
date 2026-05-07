@@ -1,296 +1,314 @@
+"""
+pgpl_demo.py — PGPL v2.0 Live Demo Dashboard
+Uses real PGPLBrain from src/pgpl_brain.py
+Run: streamlit run pgpl_demo.py
+"""
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-from collections import deque
-from scipy.signal import butter, sosfilt
+import time
 from scipy.io import wavfile
+from sklearn.metrics import f1_score, precision_score, recall_score
 
-st.set_page_config(page_title="PGPL v2.0 Demo", layout="wide")
+# ── Real Brain ────────────────────────────────────────────────────────────────
+from src.pgpl_brain import PGPLBrain, TidalWindow
 
-# ── [Brain Classes Unchanged – Same as Before] ──
-class _AdaptiveZ:
-    def __init__(self, window=100):
-        self._buf = deque(maxlen=window)
+st.set_page_config(page_title="PGPL v2.0 Demo", layout="wide", page_icon="🧠")
 
-    def score(self, value):
-        if len(self._buf) < 5:
-            self._buf.append(value)
-            return 0.0
-        mu = np.mean(self._buf)
-        sigma = np.std(self._buf) + 1e-9
-        self._buf.append(value)
-        return abs(value - mu) / sigma
+# ── Styling ───────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;600&display=swap');
+html, body, [class*="css"] { font-family: 'Barlow', sans-serif; }
+h1, h2, h3 { font-family: 'Share Tech Mono', monospace !important; }
+.dispatch-box {
+    background: #0f2a1a; border: 2px solid #00ff88;
+    padding: 1rem 1.5rem; border-radius: 6px;
+    font-family: 'Share Tech Mono', monospace;
+    color: #00ff88; font-size: 1.4rem; text-align: center;
+    animation: pulse 1s infinite;
+}
+.monitor-box {
+    background: #1a1a2e; border: 2px solid #4a4a6a;
+    padding: 1rem 1.5rem; border-radius: 6px;
+    font-family: 'Share Tech Mono', monospace;
+    color: #aaaacc; font-size: 1.4rem; text-align: center;
+}
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.6} }
+.stMetric { background: #0d1117; border-radius: 8px; padding: 0.5rem 1rem; }
+</style>
+""", unsafe_allow_html=True)
 
-class _MondirianCP:
-    def __init__(self):
-        self._cal = []
+# ── Tidal phase helper ────────────────────────────────────────────────────────
+PHASES = ["ebb", "flood", "slack_low", "slack_high", "spring"]
+def mock_tidal(i): return PHASES[i % len(PHASES)], float(np.sin(i * 0.01) * 2.5)
 
-    def calibrate(self, score):
-        self._cal.append(score)
+# ── FAR helper ────────────────────────────────────────────────────────────────
+def compute_far(y_pred, y_true):
+    denom = int(np.sum(y_true == 0))
+    return float(np.sum((y_pred == 1) & (y_true == 0)) / max(denom, 1))
 
-    def p_value(self, score):
-        if len(self._cal) < 10:
-            return 1.0
-        return np.mean(np.array(self._cal) >= score)
-
-class _PSIDrift:
-    _BINS = np.linspace(0.0, 10.0, 11)
-
-    def __init__(self, ref_window=50):
-        self._ref = deque(maxlen=ref_window)
-        self._cur = deque(maxlen=ref_window)
-        self._ready = False
-
-    def update(self, z):
-        if not self._ready:
-            self._ref.append(z)
-            if len(self._ref) == self._ref.maxlen:
-                self._ready = True
-            return 0.0
-        self._cur.append(z)
-        if len(self._cur) < 10:
-            return 0.0
-        r, _ = np.histogram(np.array(self._ref), bins=self._BINS, density=True)
-        c, _ = np.histogram(np.array(self._cur), bins=self._BINS, density=True)
-        r, c = np.clip(r, 1e-6, None), np.clip(c, 1e-6, None)
-        return np.sum((c - r) * np.log(c / r))
-
-class _TidalPhaseTracker:
-    def __init__(self, buf_n=6):
-        self.phase_buf = deque(maxlen=buf_n)
-
-    def update(self, phase):
-        self.phase_buf.append(phase)
-
-    def covered(self):
-        return len(set(self.phase_buf))
-
-class PULSE_AT_Brain:
-    def __init__(self, alpha=0.10, persistence_n=6, psi_threshold=0.20, zone_weight=0.5, min_phases=3):
-        self.alpha = alpha
-        self.min_persist = persistence_n
-        self.psi_threshold = psi_threshold
-        self.zone_weight = zone_weight
-        self.min_phases = min_phases
-        self._z = _AdaptiveZ()
-        self._cp = _MondirianCP()
-        self._psi = _PSIDrift()
-        self._flag_buf = deque(maxlen=persistence_n)
-        self._phase_tracker = _TidalPhaseTracker(persistence_n)
-        self._cal_n = 0
-        self.persist_count = 0
-        self.psi_window = deque(maxlen=50)
-
-    @staticmethod
-    def _bandpass(sig, fs=2000):
-        sos = butter(4, [200 / (0.5 * fs), 800 / (0.5 * fs)], btype="band", output="sos")
-        return sosfilt(sos, sig)
-
-    def process(self, sensors, tide_phase='unknown'):
-        fs = int(sensors.get("fs", 2000))
-        salinity = float(sensors.get("salinity", 7.0))
-        flow = float(sensors.get("flow", 13.0))
-        pressure_z = abs(flow - 13.0) / 2.0
-
-        if fs < 10:  # SCADA
-            energy = abs(pressure_z)
-        else:  # Acoustic
-            sig1 = self._bandpass(np.array(sensors["mic1_sig"]), fs)
-            energy = np.sqrt(np.mean(sig1 ** 2))
-            velocity = 1480.0  # Biot stub
-
-        z = self._z.score(energy)
-        if self._cal_n < 100:
-            self._cp.calibrate(z)
-            self._cal_n += 1
-        p_val = self._cp.p_value(z)
-        psi = self._psi.update(z)
-        alpha_adapt = self.alpha * (1 + min(psi / self.psi_threshold, 0.5))
-        self._phase_tracker.update(tide_phase)
-        flag = p_val <= alpha_adapt
-        self._flag_buf.append(flag)
-        persist_ratio = sum(self._flag_buf) / len(self._flag_buf)
-        phases_ok = self._phase_tracker.covered() >= self.min_phases
-        gated = (persist_ratio >= 0.67) and phases_ok
-
-        self.persist_count = int(flag)
-        self.psi_window.append(psi)
-
-        return {
-            "flag": "DISPATCH" if gated else "MONITOR",
-            "score": round(z, 3),
-            "p_val": round(p_val, 3),
-            "psi": round(psi, 3),
-            "energy": round(energy, 3),
-            "alpha_adapt": round(alpha_adapt, 3),
-            "persist_ratio": round(persist_ratio, 2),
-            "gated": gated,
-            "phases_covered": self._phase_tracker.covered(),
-            "salinity": round(salinity, 2),
-            "flow": round(flow, 2),
-            "tide_phase": tide_phase
-        }
-
-# ── Proxy Data Loader (Unchanged) ──
-@st.cache_data
-def load_proxy_data():
-    fs = 2000
-    N = 5000
-    t = np.arange(N) / fs
-    sig = np.sin(2 * np.pi * 400 * t) * np.exp(-((t - 2.5)**2) / 0.2) * 2 + 0.05 * np.random.randn(N)
-    salinity = np.full(N, 7.0 + 0.2 * np.sin(2 * np.pi * 0.05 * t))
-    flow = np.full(N, 13.0 + 0.5 * np.sin(2 * np.pi * 0.03 * t))
-    df = pd.DataFrame({
-        'mic1_sig': sig,
-        'salinity': salinity,
-        'flow': flow,
-        'fs': [fs] * N
-    })
+# ── File loaders ──────────────────────────────────────────────────────────────
+def load_csv(file) -> pd.DataFrame:
+    df = pd.read_csv(file)
+    # Normalise common column name variants
+    rename = {}
+    for c in df.columns:
+        cl = c.lower().strip()
+        if cl in ('pressure','psi','p','press'): rename[c] = 'pressure'
+        elif cl in ('flow','lps','q','flowrate'): rename[c] = 'flow'
+        elif cl in ('anomaly','label','leak','gt'): rename[c] = 'anomaly'
+    df.rename(columns=rename, inplace=True)
+    if 'pressure' not in df.columns: df['pressure'] = 0.0
+    if 'flow' not in df.columns:     df['flow'] = 0.0
+    if 'anomaly' not in df.columns:  df['anomaly'] = 0
     return df
 
-# ── Smart Multi-File Loader (NEW: Column Safety + Multi) ──
-def load_file_to_df(file):
-    filename = file.name
-    if filename.endswith('.csv'):
-        df = pd.read_csv(file)
-    elif filename.endswith('.wav'):
-        fs_data, sig = wavfile.read(file)
-        if sig.ndim > 1:
-            sig = sig[:, 0]
-        sig = sig.astype(np.float64) / (np.max(np.abs(sig)) + 1e-9)
-        df = pd.DataFrame({
-            'mic1_sig': sig,
-            'salinity': 7.0,
-            'flow': 13.0,
-            'fs': [fs_data] * len(sig)
-        })
-        return df  # WAV always full cols
-    else:
-        raise ValueError("Unsupported file")
+def load_wav(file):
+    fs_data, sig = wavfile.read(file)
+    if sig.ndim > 1: sig = sig[:, 0]
+    sig = sig.astype(np.float64) / (np.max(np.abs(sig)) + 1e-9)
+    return sig, fs_data
 
-    # Auto-Stub Missing Columns (Fix KeyError!)
-    if 'mic1_sig' not in df.columns:
-        df['mic1_sig'] = 0.0  # SCADA stub
-    if 'fs' not in df.columns:
-        # Auto-detect: Acoustic if mic1_sig numeric/non-zero var
-        if df['mic1_sig'].std() > 0.1:
-            df['fs'] = 2000
-        else:
-            df['fs'] = 1  # SCADA
-    if 'salinity' not in df.columns:
-        df['salinity'] = 7.0
-    if 'flow' not in df.columns:
-        df['flow'] = 13.0
-    return df
+# ══════════════════════════════════════════════════════════════════════════════
+# UI
+# ══════════════════════════════════════════════════════════════════════════════
+st.title("🧠 PGPL v2.0 — Leak Detection Demo")
+st.caption("Real PGPLBrain · Adaptive-Z · MondrianCP · Tidal Gating · P1–P4 Fusion")
 
-# ── Main App ──
-st.title("🧠 PGPL v2.0 Demo – Multi-File Pulse Gating")
-st.markdown("**Multi-upload CSVs/WAVs** or proxy. *Auto-stubs SCADA cols* (no mic1_sig? → fs=1, energy=pressure_z).")
+with st.sidebar:
+    st.header("⚙️ Settings")
+    mode = st.radio("Sensor Mode", ["SCADA (CSV)", "Acoustic (WAV pair)"])
+    base_alpha  = st.slider("Base α", 0.01, 0.20, 0.05, 0.01)
+    window_size = st.slider("Window size (rows/samples)", 100, 2000, 500, 100)
+    stream_speed = st.slider("Stream delay (s/window)", 0.0, 1.0, 0.2, 0.05)
+    saline_mode = st.checkbox("Saline / Tidal gating (EDC Busan)", value=False)
+    st.markdown("---")
+    st.caption("BattleDIM: saline=OFF  |  EDC Busan: saline=ON")
 
-# Multi-File Uploader
-uploaded_files = st.file_uploader(
-    "📁 Upload Multiple CSVs (SCADA Flows/Salinity) or WAVs", 
-    type=['csv', 'wav'], 
-    accept_multiple_files=True
-)
-
-use_proxy = st.checkbox("🔧 Use Proxy Data (BattLeDIM – overrides files)")
-
-data_mode = st.selectbox("⚙️ Data Mode", ["Auto", "SCADA (fs=1)", "Acoustic (fs=2000)"])
-
-show_preview = st.checkbox("👀 Show Data Preview")
-
-if st.button("🗑️ Clear Data"):
-    st.rerun()
-
-# Load Data
-df = None
-if use_proxy:
-    df = load_proxy_data()
-    st.success("✅ Proxy (BattLeDIM) loaded")
-elif uploaded_files:
-    dfs = []
-    for f in uploaded_files:
-        try:
-            this_df = load_file_to_df(f)
-            dfs.append(this_df)
-            st.success(f"✅ {f.name}: {len(this_df)} rows")
-        except Exception as e:
-            st.error(f"❌ {f.name}: {e}")
-    if dfs:
-        df = pd.concat(dfs, ignore_index=True)
-        st.success(f"✅ Combined: {len(df)} total rows | Columns: {list(df.columns)}")
-
-if df is not None:
-    if show_preview:
-        st.subheader("📋 Data Preview")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.dataframe(df.head(5), use_container_width=True)
-        with col2:
-            st.write("**Columns:**", list(df.columns))
-            st.write("**Shape:**", df.shape)
-            st.write("**FS Sample:**", df['fs'].iloc[0])
-
-    # Override Mode
-    if data_mode == "SCADA (fs=1)":
-        df['fs'] = 1
-        df['mic1_sig'] = 0.0
-    elif data_mode == "Acoustic (fs=2000)":
-        df['fs'] = 2000
-
-    # Sliders
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        alpha = st.slider("α (Sensitivity)", 0.05, 0.20, 0.10, 0.01)
-    with col2:
-        psi_th = st.slider("Ψ Threshold", 0.10, 0.50, 0.20, 0.01)
-    with col3:
-        window_size = st.slider("Window Size", 500, 2000, 1000, 100)
-    tide_phase = st.selectbox("🌊 Tide Phase", ["unknown", "high", "low", "ebb", "flood"])
-
-    if st.button("🚀 Process & Gate", type="primary"):
-        brain = PULSE_AT_Brain(alpha=alpha, psi_threshold=psi_th)
-        results = []
-        fs_global = int(df['fs'].iloc[0])  # Assume uniform
-        for start in range(0, len(df), window_size):
-            end = min(start + window_size, len(df))
-            chunk_sig = df['mic1_sig'].iloc[start:end].values  # Safe now!
-            sensors = {
-                "fs": fs_global,
-                "salinity": float(df['salinity'].iloc[start:end].mean()),
-                "flow": float(df['flow'].iloc[start:end].mean()),
-                "mic1_sig": chunk_sig
-            }
-            res = brain.process(sensors, tide_phase=tide_phase)
-            res['window'] = f"{start}-{end}"
-            results.append(res)
-
-        res_df = pd.DataFrame(results)
-        res_df.index = range(1, len(res_df) + 1)
-
-        # Results (Unchanged)
-        st.subheader("📊 Gating Results")
-        st.dataframe(res_df, use_container_width=True)
-
-        st.subheader("🔍 Last Window JSON")
-        st.json(res_df.iloc[-1].to_dict())
-
-        # Metrics
-        gated_count = res_df['gated'].sum()
-        dispatch_pct = (gated_count / len(res_df)) * 100
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("🚨 DISPATCH (Gated)", gated_count, f"{dispatch_pct:.1f}%")
-        col_b.metric("📈 Max Score (Z)", res_df['score'].max())
-        col_c.metric("🔄 Max Ψ (Drift)", res_df['psi'].max())
-
-        # Charts
-        st.subheader("📈 Live Metrics")
-        chart_data = res_df[['score', 'p_val', 'psi']]
-        st.line_chart(chart_data, use_container_width=True)
-
-        st.markdown("---")
-        st.caption("*Your SCADA CSV → Uses flow pressure_z. Multi-files concat. Toggles override.*")
-
+# ── File upload ───────────────────────────────────────────────────────────────
+if mode == "SCADA (CSV)":
+    uploaded = st.file_uploader("Upload SCADA CSV (pressure, flow, anomaly cols)", type=["csv"])
 else:
-    st.info("👆 Upload files or check proxy to start!")
+    col_a, col_b = st.columns(2)
+    with col_a: wav_a = st.file_uploader("Sensor A (.wav)", type=["wav"])
+    with col_b: wav_b = st.file_uploader("Sensor B (.wav)", type=["wav"])
+    gt_label = st.selectbox("Ground truth label for this file pair", [0, 1],
+                             format_func=lambda x: "1 = Leak" if x else "0 = No Leak")
+
+ready = (mode == "SCADA (CSV)" and uploaded is not None) or \
+        (mode == "Acoustic (WAV pair)" and wav_a and wav_b)
+
+if not ready:
+    st.info("👆 Upload file(s) above to begin.")
+    st.stop()
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+if st.button("🚀 Run Detection", type="primary"):
+
+    # ── Placeholders ──────────────────────────────────────────────────────────
+    status_box   = st.empty()
+    flag_box     = st.empty()
+    chart_ph     = st.empty()
+    metrics_ph   = st.empty()
+    table_ph     = st.empty()
+
+    results = []
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SCADA PATH
+    # ══════════════════════════════════════════════════════════════════════════
+    if mode == "SCADA (CSV)":
+        df = load_csv(uploaded)
+        brain = PGPLBrain(fs=1/60, saline=saline_mode, base_alpha=base_alpha)
+
+        # Warm up brain on first 20% as calibration
+        cal_end = max(len(df) // 5, 1)
+        cal_pressures = df['pressure'].iloc[:cal_end].dropna().tolist()
+        if cal_pressures:
+            mu  = float(np.mean(cal_pressures))
+            sig = float(np.std(cal_pressures)) + 1e-9
+            cal_z = [abs(v - mu) / sig for v in cal_pressures]
+            brain.calibrate_from_year(cal_z, phase="default")
+
+        n_windows = (len(df) - cal_end) // window_size
+        detect_df = df.iloc[cal_end:].reset_index(drop=True)
+
+        status_box.info(f"📡 Streaming {n_windows} windows (SCADA) …")
+
+        for i, start in enumerate(range(0, len(detect_df) - window_size + 1, window_size)):
+            end   = start + window_size
+            chunk = detect_df.iloc[start:end]
+
+            phase, tidal_psi = mock_tidal(i)
+            # Feed each row through brain, keep last event per window
+            event = None
+            for row_i, row in chunk.iterrows():
+                event = brain.process_scada(
+                    pressure_psi = float(row['pressure']),
+                    flow_lps     = float(row['flow']),
+                    timestamp    = float(i * window_size + row_i),
+                    tidal_phase  = phase,
+                    tidal_psi    = tidal_psi,
+                )
+
+            gate       = event.meta.get("gate", {})
+            confirmed  = gate.get("confirmed", False)
+            gt_win     = int(chunk['anomaly'].mean() > 0.5)
+
+            results.append({
+                "window":     f"W{i+1}",
+                "flag":       "DISPATCH" if confirmed else "MONITOR",
+                "score":      round(event.severity_raw, 4),
+                "p1":         round(event.p1_score, 4),
+                "p2":         round(event.p2_score, 4),
+                "p4_drift":   round(event.p4_score, 4),
+                "confidence": round(event.confidence, 3),
+                "phase":      phase,
+                "gt_anomaly": gt_win,
+            })
+
+            res_df = pd.DataFrame(results)
+
+            # Live flag
+            if confirmed:
+                flag_box.markdown('<div class="dispatch-box">🚨 DISPATCH — LEAK DETECTED</div>',
+                                  unsafe_allow_html=True)
+            else:
+                flag_box.markdown('<div class="monitor-box">🟢 MONITOR</div>',
+                                  unsafe_allow_html=True)
+
+            # Live chart
+            with chart_ph.container():
+                st.subheader("📈 Live Signal")
+                chart_cols = [c for c in ['score','p1','p2','p4_drift','gt_anomaly']
+                              if c in res_df.columns]
+                st.line_chart(res_df[chart_cols], use_container_width=True)
+
+            # Running metrics
+            if len(res_df) > 2:
+                y_p = (res_df['flag'] == 'DISPATCH').astype(int).values
+                y_t = res_df['gt_anomaly'].values
+                with metrics_ph.container():
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    mc1.metric("F1",        f"{f1_score(y_t,y_p,zero_division=0):.3f}")
+                    mc2.metric("Precision", f"{precision_score(y_t,y_p,zero_division=0):.3f}")
+                    mc3.metric("Recall",    f"{recall_score(y_t,y_p,zero_division=0):.3f}")
+                    mc4.metric("FAR",       f"{compute_far(y_p,y_t):.3f}")
+
+            with table_ph.container():
+                st.dataframe(res_df[['window','flag','score','p1','p2','confidence','gt_anomaly']].tail(8),
+                             use_container_width=True)
+
+            time.sleep(stream_speed)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ACOUSTIC PATH
+    # ══════════════════════════════════════════════════════════════════════════
+    else:
+        sig_a, fs_a = load_wav(wav_a)
+        sig_b, fs_b = load_wav(wav_b)
+        fs = fs_a  # use sensor A fs
+
+        if fs < 8000:
+            st.error(f"WAV fs={fs}Hz is below 8000Hz minimum for acoustic path.")
+            st.stop()
+
+        brain = PGPLBrain(
+            fs               = float(fs),
+            pipe_diameter_m  = 0.05,
+            pipe_thickness_m = 0.005,
+            pipe_material    = "hdpe",
+            saline           = saline_mode,
+            sensor_spacing_m = 1.5,
+            base_alpha       = base_alpha,
+        )
+
+        # Pre-load 5 tidal phases so gate isn't blocked from window 1
+        for ph in PHASES:
+            brain.tidal.add_phase(TidalWindow(
+                phase=ph, psi_offset=0.0,
+                alpha_adj=brain.tidal.adaptive_alpha(),
+                timestamp=0.0,
+            ))
+
+        min_len    = min(len(sig_a), len(sig_b))
+        n_windows  = min_len // window_size
+        status_box.info(f"🎙 Streaming {n_windows} acoustic windows (fs={fs}Hz) …")
+
+        for i in range(n_windows):
+            s = i * window_size
+            e = s + window_size
+            chunk_a = sig_a[s:e]
+            chunk_b = sig_b[s:e]
+
+            phase, tidal_psi = mock_tidal(i)
+            event = brain.process_acoustic(chunk_a, chunk_b, float(i), phase, tidal_psi)
+
+            gate      = event.meta.get("gate", {})
+            confirmed = gate.get("confirmed", False)
+
+            results.append({
+                "window":      f"W{i+1}",
+                "flag":        "DISPATCH" if confirmed else "MONITOR",
+                "score":       round(event.severity_raw, 4),
+                "p3_tdoa":     round(event.p3_score, 4),
+                "p4_tidal":    round(event.p4_score, 4),
+                "location_m":  round(event.location_m, 3),
+                "freq_hz":     event.meta.get("freq_centroid_hz", 0),
+                "confidence":  round(event.confidence, 3),
+                "gt_anomaly":  gt_label,
+            })
+
+            res_df = pd.DataFrame(results)
+
+            if confirmed:
+                flag_box.markdown('<div class="dispatch-box">🚨 DISPATCH — LEAK DETECTED</div>',
+                                  unsafe_allow_html=True)
+            else:
+                flag_box.markdown('<div class="monitor-box">🟢 MONITOR</div>',
+                                  unsafe_allow_html=True)
+
+            with chart_ph.container():
+                st.subheader("📈 Live Signal")
+                st.line_chart(res_df[['score','p3_tdoa','p4_tidal']], use_container_width=True)
+
+            # Aggregate metrics (all windows so far, same GT label)
+            if len(res_df) > 2:
+                y_p = (res_df['flag'] == 'DISPATCH').astype(int).values
+                y_t = res_df['gt_anomaly'].values
+                with metrics_ph.container():
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    mc1.metric("F1",        f"{f1_score(y_t,y_p,zero_division=0):.3f}")
+                    mc2.metric("Precision", f"{precision_score(y_t,y_p,zero_division=0):.3f}")
+                    mc3.metric("Recall",    f"{recall_score(y_t,y_p,zero_division=0):.3f}")
+                    mc4.metric("FAR",       f"{compute_far(y_p,y_t):.3f}")
+
+            with table_ph.container():
+                st.dataframe(
+                    res_df[['window','flag','score','p3_tdoa','location_m','freq_hz','gt_anomaly']].tail(8),
+                    use_container_width=True)
+
+            time.sleep(stream_speed)
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    status_box.success("✅ Detection complete.")
+    res_df = pd.DataFrame(results)
+    y_p = (res_df['flag'] == 'DISPATCH').astype(int).values
+    y_t = res_df['gt_anomaly'].values
+
+    st.subheader("📊 Final Metrics")
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    fc1.metric("F1",        f"{f1_score(y_t,y_p,zero_division=0):.3f}")
+    fc2.metric("Precision", f"{precision_score(y_t,y_p,zero_division=0):.3f}")
+    fc3.metric("Recall",    f"{recall_score(y_t,y_p,zero_division=0):.3f}")
+    fc4.metric("FAR",       f"{compute_far(y_p,y_t):.3f}")
+
+    st.subheader("📋 Full Results")
+    st.dataframe(res_df, use_container_width=True)
+
+    csv = res_df.to_csv(index=False).encode()
+    st.download_button("⬇️ Download results CSV", csv, "pgpl_results.csv", "text/csv")
